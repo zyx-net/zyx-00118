@@ -77,6 +77,14 @@ def cli(ctx, config_path):
 
         db = Database(config.db_path)
         workflow = WorkflowManager(config, db)
+        restore_result = workflow.restore_locks_on_startup()
+        if restore_result.get("restored") and restore_result.get("total_locks", 0) > 0:
+            click.echo(click.style(
+                f"[锁状态恢复] 共 {restore_result['total_locks']} 条锁，"
+                f"其中已过期 {restore_result['expired_locks']} 条。"
+                f"配置超时: {restore_result.get('config_timeout', 'N/A')} 秒",
+                fg="yellow"
+            ))
         ctx.obj = {
             "config": config,
             "db": db,

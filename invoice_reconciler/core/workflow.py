@@ -45,6 +45,83 @@ class WorkflowManager:
             elif existing.get("role") != USER_ROLE_ADMIN:
                 self.db.update_user_role(admin_user, USER_ROLE_ADMIN)
 
+    def restore_locks_on_startup(self) -> Dict:
+        if not self.config.enable_lock:
+            return {
+                "restored": False,
+                "reason": "锁功能已禁用",
+                "total_locks": 0,
+                "expired_locks": 0,
+                "auto_expired_count": 0,
+            }
+
+        now = datetime.now()
+        timeout_seconds = self.config.lock_timeout_seconds
+
+        all_locks = self.db.list_all_locks(include_expired=True)
+        total_locks = len(all_locks)
+        expired_count = 0
+        auto_expired_count = 0
+
+        for lock in all_locks:
+            lock_id = lock["id"]
+            match_id = lock["match_id"]
+            current_lock = self.db.get_match_lock(match_id)
+
+            if not current_lock:
+                continue
+
+            locked_at_str = current_lock.get("locked_at")
+            if not locked_at_str:
+                continue
+
+            try:
+                locked_at = datetime.strptime(locked_at_str, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+
+            configured_expires_at = locked_at + timedelta(seconds=timeout_seconds) if timeout_seconds > 0 else None
+            db_expires_at_str = current_lock.get("lock_expires_at")
+
+            if timeout_seconds > 0:
+                if not db_expires_at_str:
+                    with self.db._get_conn() as conn:
+                        conn.execute(
+                            "UPDATE match_locks SET lock_expires_at = ? WHERE id = ?",
+                            (configured_expires_at.strftime("%Y-%m-%d %H:%M:%S"), lock_id)
+                        )
+                    db_expires_at_str = configured_expires_at.strftime("%Y-%m-%d %H:%M:%S")
+
+                try:
+                    db_expires_at = datetime.strptime(db_expires_at_str, "%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    continue
+
+                if db_expires_at < configured_expires_at:
+                    with self.db._get_conn() as conn:
+                        conn.execute(
+                            "UPDATE match_locks SET lock_expires_at = ? WHERE id = ?",
+                            (configured_expires_at.strftime("%Y-%m-%d %H:%M:%S"), lock_id)
+                        )
+
+            existing_expires = current_lock.get("lock_expires_at")
+            if existing_expires:
+                try:
+                    expire_time = datetime.strptime(existing_expires, "%Y-%m-%d %H:%M:%S")
+                    if expire_time <= now:
+                        expired_count += 1
+                except (ValueError, TypeError):
+                    pass
+
+        return {
+            "restored": True,
+            "reason": "按配置恢复锁状态完成",
+            "total_locks": total_locks,
+            "expired_locks": expired_count,
+            "auto_expired_count": auto_expired_count,
+            "config_timeout": timeout_seconds,
+        }
+
     def get_user_role(self, username: str) -> str:
         user = self.db.get_user(username)
         if user:
@@ -161,20 +238,27 @@ class WorkflowManager:
 
         lock = self.db.get_match_lock(match_id)
         if not lock:
-            return True, "记录未锁定"
+            return False, "该记录未被锁定，请先执行 'lock acquire' 锁定后再操作"
 
         if lock["lock_owner"] == username:
+            if lock.get("lock_expires_at"):
+                try:
+                    expire_time = datetime.strptime(lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S")
+                    if expire_time <= datetime.now():
+                        return False, "您持有的锁已过期，请重新执行 'lock takeover' 接管后再操作"
+                except (ValueError, TypeError):
+                    pass
             return True, "您是该记录的责任人"
 
         if lock.get("lock_expires_at"):
             try:
                 expire_time = datetime.strptime(lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S")
                 if expire_time <= datetime.now():
-                    return True, "锁已过期"
+                    return False, f"该记录由 {lock['lock_owner']} 锁定（锁已过期），请先执行 'lock takeover' 接管后再操作"
             except (ValueError, TypeError):
                 pass
 
-        return False, f"该记录由 {lock['lock_owner']} 锁定，您无法操作"
+        return False, f"该记录由 {lock['lock_owner']} 锁定，您无法操作。如为紧急情况请联系管理员强制解锁"
 
     def acquire_lock(self, match_id: int, username: str,
                      reason: str = None) -> Dict:

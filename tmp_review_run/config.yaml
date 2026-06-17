@@ -11,10 +11,10 @@ payment_required_columns:
   - payment_date
   - customer
   - amount
-export_format: xlsx
-db_path: invoice_reconciler/data/reconciler.db
-export_dir: invoice_reconciler/exports
-lock_timeout_seconds: 3600
+export_format: json
+db_path: tmp_review_run/review.db
+export_dir: tmp_review_run/exports
+lock_timeout_seconds: 1
 default_user_role: reviewer
 admin_users:
   - admin

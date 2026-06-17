@@ -1,0 +1,4 @@
+﻿历史ID,匹配ID,发票ID,收款ID,原状态,新状态,操作人,备注,变更时间
+3,4,4,4,已匹配,已撤销,reviewer_c,revoke manual without lock,2026-06-17 19:26:02
+2,,4,4,未匹配,已匹配,reviewer_c,manual without lock on unmatched,2026-06-17 19:25:44
+1,,1,1,未匹配,已匹配,reviewer_a,自动精确匹配,2026-06-17 19:25:16

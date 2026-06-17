@@ -171,15 +171,15 @@ class MatchEngine:
         if not match:
             raise ValueError(f"匹配记录不存在: {match_id}")
 
-        if match["status"] != MATCH_STATUS_PENDING:
-            raise ValueError(
-                f"只能确认待确认状态的匹配，当前状态: {match['status']}"
-            )
-
         if self.workflow and self.config.enable_lock:
             can_operate, msg = self.workflow.can_operate_match(operator, match_id)
             if not can_operate:
                 raise ValueError(msg)
+
+        if match["status"] != MATCH_STATUS_PENDING:
+            raise ValueError(
+                f"只能确认待确认状态的匹配，当前状态: {match['status']}"
+            )
 
         if selected_payment_id and selected_payment_id != match["payment_id"]:
             candidates = self.db.get_match_candidates(match["invoice_id"])

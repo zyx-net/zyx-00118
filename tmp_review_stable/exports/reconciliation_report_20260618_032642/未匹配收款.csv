@@ -1,0 +1,4 @@
+﻿收款ID,收款号,收款日期,客户,收款金额,收款状态,匹配状态,文件行号,来源文件,导入时间,错误信息
+3,RPAY003,2024-01-12,Gamma Inc,300.0,normal,未匹配,4,custom_payments.csv,2026-06-17 19:25:09,
+4,RPAY004,2024-01-13,Gamma Inc,300.0,normal,未匹配,5,custom_payments.csv,2026-06-17 19:25:09,
+2,RPAY002,2024-01-15,Beta LLC,199.99,normal,未匹配,3,custom_payments.csv,2026-06-17 19:25:09,

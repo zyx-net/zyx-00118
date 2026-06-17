@@ -69,6 +69,39 @@ class ReportExporter:
             "是否锁定": "是（已过期）" if is_expired == "是" else "是",
         }
 
+    def _get_lock_history_and_evidence(self, match_id: int, match: Dict) -> Dict:
+        lock_history = self.db.get_lock_history(match_id=match_id)
+        from .workflow import LOCK_STATUS_LABELS
+        lock_history_str = "; ".join([
+            f"{lh['created_at']}: {LOCK_STATUS_LABELS.get(lh['action'], lh['action'])} "
+            f"(操作人: {lh['operator']}, 原持有人: {lh['old_owner'] or '-'}, "
+            f"新持有人: {lh['new_owner'] or '-'}, 原因: {lh['reason'] or '-'})"
+            for lh in lock_history
+        ])
+
+        takeover_reason = ""
+        for lh in lock_history:
+            if lh.get("action") == "takeover" and lh.get("reason"):
+                takeover_reason = lh["reason"]
+                break
+
+        last_confirm_evidence = ""
+        if match["status"] == MATCH_STATUS_MATCHED:
+            last_confirm_evidence = (
+                f"确认人: {match.get('operator', '-')}, "
+                f"备注: {match.get('operator_remark', '-')}, "
+                f"确认时间: {match.get('confirmed_at', '-')}, "
+                f"匹配类型: {MATCH_TYPE_LABELS.get(match.get('match_type'), match.get('match_type', '-'))}, "
+                f"得分: {match.get('match_score', '-')}, "
+                f"证据: {match.get('match_evidence', '-')}"
+            )
+
+        return {
+            "锁历史": lock_history_str,
+            "接管原因": takeover_reason,
+            "最后确认证据": last_confirm_evidence,
+        }
+
     def _generate_summary(self) -> List[Dict]:
         stats = self.db.get_statistics()
         config_info = self.config.to_dict()
@@ -105,6 +138,7 @@ class ReportExporter:
             ])
 
             lock_info = self._get_lock_info(m["id"])
+            lock_extra = self._get_lock_history_and_evidence(m["id"], m)
 
             item = {
                 "匹配编号": m["match_no"],
@@ -132,6 +166,7 @@ class ReportExporter:
                 "状态历史": history_str,
             }
             item.update(lock_info)
+            item.update(lock_extra)
             result.append(item)
         return result
 
@@ -140,6 +175,7 @@ class ReportExporter:
         result = []
         for m in matches:
             lock_info = self._get_lock_info(m["id"])
+            lock_extra = self._get_lock_history_and_evidence(m["id"], m)
             item = {
                 "匹配编号": m["match_no"],
                 "匹配类型": MATCH_TYPE_LABELS.get(m["match_type"], m["match_type"]),
@@ -161,6 +197,7 @@ class ReportExporter:
                 "创建时间": m["created_at"],
             }
             item.update(lock_info)
+            item.update(lock_extra)
             result.append(item)
         return result
 
@@ -172,11 +209,12 @@ class ReportExporter:
             history_str = "; ".join([
                 f"{h['changed_at']}: {STATUS_LABELS.get(h['old_status'], h['old_status'])} -> "
                 f"{STATUS_LABELS.get(h['new_status'], h['new_status'])} "
-                f"(操作人: {h['operator'] or '系统'})"
+                f"(操作人: {h['operator'] or '系统'}, 备注: {h['remark'] or '-'})"
                 for h in history
             ])
 
             lock_info = self._get_lock_info(m["id"])
+            lock_extra = self._get_lock_history_and_evidence(m["id"], m)
 
             item = {
                 "匹配编号": m["match_no"],
@@ -196,6 +234,7 @@ class ReportExporter:
                 "状态历史": history_str,
             }
             item.update(lock_info)
+            item.update(lock_extra)
             result.append(item)
         return result
 
@@ -245,11 +284,12 @@ class ReportExporter:
             history_str = "; ".join([
                 f"{h['changed_at']}: {STATUS_LABELS.get(h['old_status'], h['old_status'])} -> "
                 f"{STATUS_LABELS.get(h['new_status'], h['new_status'])} "
-                f"(操作人: {h['operator'] or '系统'})"
+                f"(操作人: {h['operator'] or '系统'}, 备注: {h['remark'] or '-'})"
                 for h in history
             ])
 
             lock_info = self._get_lock_info(m["id"])
+            lock_extra = self._get_lock_history_and_evidence(m["id"], m)
 
             item = {
                 "匹配编号": m["match_no"],
@@ -263,6 +303,7 @@ class ReportExporter:
                 "状态历史": history_str,
             }
             item.update(lock_info)
+            item.update(lock_extra)
             result.append(item)
         return result
 

@@ -1,0 +1,6 @@
+﻿payment_no,payment_date,customer,amount,remark
+RPAY001,2024-01-10,Alpha Co,100.00,exact
+RPAY002,2024-01-15,Beta LLC,199.99,fuzzy pending
+RPAY003,2024-01-12,Gamma Inc,300.00,multi one
+RPAY004,2024-01-13,Gamma Inc,300.00,multi two
+RPAY005,2024-01-14,,500.00,missing customer

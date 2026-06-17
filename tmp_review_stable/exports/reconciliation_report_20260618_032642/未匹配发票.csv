@@ -1,0 +1,4 @@
+﻿发票ID,发票号,发票日期,客户,发票金额,发票状态,匹配状态,文件行号,来源文件,导入时间,错误信息
+2,RINV002,2024-01-11,Beta LLC,200.0,normal,未匹配,3,custom_invoices.csv,2026-06-17 19:25:03,
+3,RINV003,2024-01-12,Gamma Inc,300.0,normal,未匹配,4,custom_invoices.csv,2026-06-17 19:25:03,
+4,RINV004,2024-01-13,NoPay Ltd,400.0,normal,未匹配,5,custom_invoices.csv,2026-06-17 19:25:03,

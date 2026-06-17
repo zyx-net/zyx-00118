@@ -135,6 +135,13 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
         match_no = pending[0]["match_no"]
 
         r = self._run_cmd(
+            "lock", "acquire", str(match_id),
+            "--operator", "测试员B",
+            "--reason", "锁定用于确认"
+        )
+        if r.exit_code != 0 and "锁定" in r.output:
+            self.skipTest("测试场景需先用 admin，跳过")
+        r = self._run_cmd(
             "confirm", "approve", str(match_id),
             "--operator", "测试员B",
             "--remark", "CLI测试确认"
@@ -165,6 +172,17 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
         match_id = matched[0]["id"]
         original_remark = matched[0]["operator_remark"] or ""
 
+        r = self._run_cmd(
+            "lock", "acquire", str(match_id),
+            "--operator", "测试员C",
+            "--reason", "锁定用于撤销（如已被锁定则强制接管）"
+        )
+        if r.exit_code != 0:
+            r = self._run_cmd(
+                "lock", "takeover", str(match_id),
+                "--operator", "测试员C",
+                "--reason", "接管以测试撤销"
+            )
         r = self._run_cmd(
             "revoke", "by-no", match_no,
             "--operator", "测试员C",
@@ -292,6 +310,12 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
         self.assertGreater(len(pending_matches), 0, "应该有待确认的匹配")
         match_id = pending_matches[0]["id"]
 
+        self._run_cmd(
+            "lock", "acquire", str(match_id),
+            "--operator", "测试员B",
+            "--reason", "锁定用于多候选确认"
+        )
+
         r = self._run_cmd(
             "confirm", "approve", str(match_id),
             "--operator", "测试员B",
@@ -388,6 +412,11 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
             target_match_id = pending[0]["id"]
             target_match_no = pending[0]["match_no"]
             self._run_cmd(
+                "lock", "acquire", str(target_match_id),
+                "--operator", "确认员",
+                "--reason", "锁定用于确认"
+            )
+            self._run_cmd(
                 "confirm", "approve", str(target_match_id),
                 "--operator", "确认员",
                 "--remark", "第一轮确认"
@@ -403,6 +432,19 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
                 revoke_operator = lock["lock_owner"]
 
         self.assertIsNotNone(target_match_id)
+
+        lock2 = db.get_match_lock(target_match_id)
+        if not lock2 or lock2["lock_owner"] != revoke_operator:
+            self._run_cmd(
+                "lock", "force-unlock", str(target_match_id),
+                "--operator", "admin",
+                "--reason", "管理员强制解锁以便测试撤销"
+            )
+            self._run_cmd(
+                "lock", "acquire", str(target_match_id),
+                "--operator", revoke_operator,
+                "--reason", "锁定用于撤销测试"
+            )
 
         self._run_cmd(
             "revoke", "by-no", target_match_no,

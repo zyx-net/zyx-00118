@@ -1,0 +1,6 @@
+﻿invoice_no,invoice_date,customer,amount,status,remark
+RINV001,2024-01-10,Alpha Co,100.00,normal,review exact
+RINV002,2024-01-11,Beta LLC,200.00,normal,review pending
+RINV003,2024-01-12,Gamma Inc,300.00,normal,review multi
+RINV004,2024-01-13,NoPay Ltd,400.00,normal,review unmatched
+RINV005,2024-01-14,,500.00,normal,missing customer

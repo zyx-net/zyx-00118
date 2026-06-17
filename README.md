@@ -97,36 +97,54 @@ python -m invoice_reconciler.cli.main confirm list --status pending
 python -m invoice_reconciler.cli.main confirm candidates
 ```
 
-### 7. 人工确认匹配
+### 7. 人工确认匹配（⚠️ 必须先锁定再操作）
+
+> **重要**：普通复核员（非 admin）**必须先 `lock acquire` 拿到自己的锁**才能确认/拒绝/改配/撤销；管理员可跳过。
 
 ```bash
-# 查看待确认列表
+# 查看待确认列表，记下要处理的匹配ID（第一列）
 python -m invoice_reconciler.cli.main confirm list --status pending
 
-# 查看匹配详情
-python -m invoice_reconciler.cli.main confirm show 1
+# ⭐ 第一步：先锁定该条记录（必须与 confirm 的 --operator 是同一个人）
+python -m invoice_reconciler.cli.main lock acquire 2 --operator 张三 --reason "与客户核对中"
 
-# 确认匹配
+# 查看匹配详情
+python -m invoice_reconciler.cli.main confirm show 2
+
+# 第二步：确认匹配（同一位操作员，持锁才能成功）
 python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
+
+# 处理完释放锁（可选，超时会自动过期）
+python -m invoice_reconciler.cli.main lock release 2 --operator 张三
+
+# --- 多候选场景 ---
 
 # 查看多候选收款列表（显示收款ID，与 --select-payment 参数对应）
 python -m invoice_reconciler.cli.main confirm candidates --invoice-id 4
 
+# ⭐ 先锁定
+python -m invoice_reconciler.cli.main lock acquire 3 --operator 张三 --reason "多候选人工改配"
+
 # 多候选时选择特定收款（--select-payment 传入的是收款ID，即 candidates 列表中的"收款ID"列）
 python -m invoice_reconciler.cli.main confirm approve 3 --operator 张三 --select-payment 6 --remark "选择第二笔收款"
 
-# 拒绝匹配
+# --- 拒绝匹配 ---
+python -m invoice_reconciler.cli.main lock acquire 4 --operator 张三 --reason "核对不符需拒绝"
 python -m invoice_reconciler.cli.main confirm reject 4 --operator 张三 --remark "客户名称不符，需核查"
 
-# 人工强制匹配（指定发票ID和收款ID）
+# --- 人工强制匹配（指定发票ID和收款ID）---
+python -m invoice_reconciler.cli.main lock acquire 6 --operator 张三 --reason "人工改配"
 python -m invoice_reconciler.cli.main confirm manual 6 13 --operator 张三 --remark "手工匹配"
 ```
 
-### 8. 撤销匹配
+### 8. 撤销匹配（⚠️ 必须先锁定再操作）
 
 ```bash
 # 查看可撤销的匹配
 python -m invoice_reconciler.cli.main revoke list
+
+# ⭐ 先锁定（普通复核员必须持锁，管理员可跳过）
+python -m invoice_reconciler.cli.main lock acquire 1 --operator 张三 --reason "需撤销并重新核对"
 
 # 按ID撤销
 python -m invoice_reconciler.cli.main revoke match 1 --operator 张三 --remark "匹配错误，需重新核对"
@@ -402,112 +420,213 @@ A: 是。JSON/CSV/快照导出都包含当前责任人、锁历史、接管原�
 
 ## 从导入到回放校验的完整命令链
 
-以下是一个完整的对账复核流程示例：
+以下命令链**严格遵循先锁再处理**，可以复制粘贴从零开始实际跑通。匹配 ID 是自增的，请按 `status` 输出的真实 ID 替换示例中的数字。
 
 ```bash
-# 1. 导入数据
-python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 张三
-python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sample_payments.csv --operator 张三
+# ── 0. 清理旧数据库（可选，从零开始） ──
+# Windows (PowerShell):
+Remove-Item -Recurse -Force invoice_reconciler\data\reconciler.db -ErrorAction SilentlyContinue
+# Linux / macOS:
+# rm -f invoice_reconciler/data/reconciler.db
 
-# 2. 自动匹配
-python -m invoice_reconciler.cli.main match --operator 张三
+# ═══════════════════════════════════════════
+#  第一阶段：导入 → 自动匹配
+# ═══════════════════════════════════════════
 
-# 3. 查看匹配状态
+# 1. 导入发票台账（15 条示例，11 条成功）
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator zhangsan
+
+# 2. 导入收款流水（17 条示例，15 条成功）
+python -m invoice_reconciler.cli.main import payments \
+    invoice_reconciler/data/sample_payments.csv --operator zhangsan
+
+# 3. 运行自动匹配（会输出 "待人工确认的匹配ID: Mxxxx..." 列表）
+python -m invoice_reconciler.cli.main match --operator zhangsan
+
+# 4. 查看状态，找到第一条 "待确认匹配" 的 ID（第一列数字，示例中是 8）
 python -m invoice_reconciler.cli.main status
-python -m invoice_reconciler.cli.main confirm list --status pending
+#    记下待确认列表第一个 ID，例如 9（INV005，模糊匹配，金额 3200 vs 3199.99）
+#    下文用 <PENDING_ID> 代表这个值，请自行替换
 
-# 4. 创建导入后快照（用于后续回放对比）
-python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "自动匹配完成"
+# 5. 创建导入后快照（用于后续回放对比）
+python -m invoice_reconciler.cli.main review snapshot create \
+    --operator zhangsan --description "自动匹配完成"
 
-# 5. 查看多候选匹配
-python -m invoice_reconciler.cli.main confirm candidates
+# ═══════════════════════════════════════════
+#  第二阶段：先锁再处理（核心约束演示）
+# ═══════════════════════════════════════════
 
-# 6. 查看指定发票的候选收款（显示收款ID，用于 --select-payment 参数）
-python -m invoice_reconciler.cli.main confirm candidates --invoice-id 4
+# 6. ❌ 演示失败：不锁定直接 confirm（普通复核员 lisi 应被拒绝）
+python -m invoice_reconciler.cli.main confirm approve <PENDING_ID> \
+    --operator lisi --remark "未锁定就确认(会失败)"
+#    预期输出：[!!] 该记录未被锁定，请先执行 'lock acquire' 锁定后再操作
 
-# 7. 普通确认（单条匹配）
-python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
+# 7. ✅ 正确流程：lisi 先 lock acquire 拿到锁
+python -m invoice_reconciler.cli.main lock acquire <PENDING_ID> \
+    --operator lisi --reason "lisi 与客户电话核对中"
 
-# 8. 多候选确认（选择指定收款，--select-payment 传收款ID，即 candidates 列表中"收款ID"列）
-python -m invoice_reconciler.cli.main confirm approve 3 --operator 张三 --select-payment 6 --remark "选择第二笔收款"
+# 8. 查看 lisi 持有的锁
+python -m invoice_reconciler.cli.main lock list --owner lisi
 
-# 9. 按编号撤销匹配
-python -m invoice_reconciler.cli.main revoke by-no M202606180001 --operator 李四 --remark "匹配错误，需重新核对"
+# 9. ❌ 锁冲突：zhangsan 同时想锁定同一条记录（应被拒绝，报 "已被 lisi 锁定"）
+python -m invoice_reconciler.cli.main lock acquire <PENDING_ID> \
+    --operator zhangsan --reason "zhangsan 也想处理"
 
-# 10. 创建确认后快照
-python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "第一轮人工确认完成"
+# 10. ✅ 持锁后 confirm approve（同一位操作员 lisi，成功）
+python -m invoice_reconciler.cli.main confirm approve <PENDING_ID> \
+    --operator lisi --remark "电话与客户核对一致，确认该笔匹配"
 
-# 11. 导出快照（JSON 格式，带稳定编号）
-python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format json
+# 11. 查看详情（含确认人、确认时间、状态历史、锁信息）
+python -m invoice_reconciler.cli.main confirm show <PENDING_ID>
 
-# 12. 导出快照（CSV 格式，同一编号重复导出，内容一致）
-python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format csv
+# 12. 完成处理后释放锁
+python -m invoice_reconciler.cli.main lock release <PENDING_ID> --operator lisi
 
-# 13. 回放校验（检测当前状态与历史快照的差异）
-python -m invoice_reconciler.cli.main review replay --snapshot-no R202606180001
+# ═══════════════════════════════════════════
+#  第三阶段：接管过期锁 → 撤销重做（历史不冲掉）
+# ═══════════════════════════════════════════
 
-# 14. 冲突检测（检查同一发票是否被多人重复处理）
-python -m invoice_reconciler.cli.main review conflicts
+# 13. 再找另一条待确认记录，zhangsan 锁定（<PENDING_ID_2>）
+python -m invoice_reconciler.cli.main lock acquire <PENDING_ID_2> \
+    --operator zhangsan --reason "zhangsan 锁定后长期不处理"
 
-# 15. 查看冲突详情（指定发票号）
-python -m invoice_reconciler.cli.main review conflicts --invoice-no INV001
+# 14. ⚡ 管理员强制模拟过期（实际是等 lock_timeout_seconds 秒；或用 DB 直接改时间）
+#     然后 lisi 接管这条过期锁
+python -m invoice_reconciler.cli.main lock takeover <PENDING_ID_2> \
+    --operator lisi --reason "原锁长期未处理，已过期，lisi 接管"
 
-# 16. 创建最终快照并导出完整报告
-python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "最终复核完成"
-python -m invoice_reconciler.cli.main export full --operator 张三 --format json
+# 15. lisi 接管后撤销（锁历史中的 zhangsan→lisi 接管链条不会丢）
+python -m invoice_reconciler.cli.main revoke match <PENDING_ID_2> \
+    --operator lisi --remark "接管后发现匹配有误，撤销"
+
+# 16. 查看锁操作历史（应同时看到 zhangsan 的锁定 + lisi 的 takeover + revoke）
+python -m invoice_reconciler.cli.main lock history --match-id <PENDING_ID_2>
+
+# 17. 撤销后重做：重新人工匹配新记录（旧的锁历史/状态历史保留在原记录上）
+python -m invoice_reconciler.cli.main list-unmatched --type invoices
+python -m invoice_reconciler.cli.main confirm manual 6 13 --operator admin \
+    --remark "撤销后重新人工匹配，管理员可跳过锁"
+
+# ═══════════════════════════════════════════
+#  第四阶段：导出 + 快照 + 回放
+# ═══════════════════════════════════════════
+
+# 18. 创建确认后快照
+python -m invoice_reconciler.cli.main review snapshot create \
+    --operator zhangsan --description "第一轮人工确认完成"
+#    记下输出的快照编号，如 R202606180001，下文用 <SNAPSHOT_NO>
+
+# 19. 导出 JSON 完整报告（含：责任人 / 锁历史 / 接管原因 / 最后确认证据）
+python -m invoice_reconciler.cli.main export full --operator lisi --format json
+#    打开导出的 JSON，任意已匹配记录可见字段：
+#    - 当前责任人 / 锁定原因 / 锁定时间 / 锁到期时间 / 是否锁定
+#    - 锁历史（完整操作链：锁定→接管→解锁→...）
+#    - 接管原因（提取 takeover 的 reason）
+#    - 最后确认证据（确认人+备注+时间+类型+得分+证据）
+
+# 20. 导出 CSV 完整报告（同样包含上述锁字段）
+python -m invoice_reconciler.cli.main export full --operator lisi --format csv
+
+# 21. 导出快照（JSON / CSV，带稳定编号，同一快照可多次导出编号不变）
+python -m invoice_reconciler.cli.main export snapshot \
+    --snapshot-no <SNAPSHOT_NO> --operator zhangsan --format json
+python -m invoice_reconciler.cli.main export snapshot \
+    --snapshot-no <SNAPSHOT_NO> --operator zhangsan --format csv
+
+# 22. 回放校验（检测当前状态与历史快照是否一致，输出差异详情）
+python -m invoice_reconciler.cli.main review replay --snapshot-no <SNAPSHOT_NO>
+
+# ═══════════════════════════════════════════
+#  第五阶段：管理员操作（强制解锁 / 批量解锁）
+# ═══════════════════════════════════════════
+
+# 23. 先造几条被 zhangsan 锁定的记录
+python -m invoice_reconciler.cli.main lock acquire <ANOTHER_ID_1> \
+    --operator zhangsan --reason "处理中"
+python -m invoice_reconciler.cli.main lock acquire <ANOTHER_ID_2> \
+    --operator zhangsan --reason "处理中"
+
+# 24. 管理员 admin 强制解锁单条记录
+python -m invoice_reconciler.cli.main lock force-unlock <ANOTHER_ID_1> \
+    --operator admin --reason "张三请假，管理员强制释放"
+
+# 25. 管理员批量解锁 zhangsan 持有的所有锁
+python -m invoice_reconciler.cli.main lock batch-unlock \
+    --operator admin --reason "批量释放张三的锁（请假交接）" --owner zhangsan
+
+# 26. 再次 import 同一旧批次（不会冲掉现有锁和历史）
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator zhangsan
+#    预期输出："文件已导入，批次ID: x，跳过重复导入"
+
+# 27. 最终快照 + 完整报告
+python -m invoice_reconciler.cli.main review snapshot create \
+    --operator admin --description "最终复核完成"
+python -m invoice_reconciler.cli.main export full --operator admin --format json
+
+# 28. 跑测试套件验证
+python -m unittest discover -s tests -v
 ```
 
-## 示例完整流程
+## 示例完整流程（日常使用，严格先锁再操作）
+
+> 运行前先清理：`Remove-Item -Force invoice_reconciler\data\reconciler.db`（Windows）
 
 ```bash
 # 1. 安装依赖
 pip install -r requirements.txt
 
-# 2. 查看配置
+# 2. 查看/修改配置
 python -m invoice_reconciler.cli.main config show
+# python -m invoice_reconciler.cli.main config set --amount-tolerance 0.01 --date-window 30 --export-format json
 
 # 3. 导入发票和收款
-python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 张三
-python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sample_payments.csv --operator 张三
+python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator zhangsan
+python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sample_payments.csv --operator zhangsan
 
 # 4. 查看导入错误
 python -m invoice_reconciler.cli.main import errors
 
 # 5. 运行自动匹配
-python -m invoice_reconciler.cli.main match --operator 张三
+python -m invoice_reconciler.cli.main match --operator zhangsan
 
-# 6. 查看状态
+# 6. 查看状态并记录待确认列表的第一个 ID（第一列，如 8/9/10...）
 python -m invoice_reconciler.cli.main status
+# 假设第一个待确认 ID 是 <PID>
 
-# 7. 查看待确认匹配
-python -m invoice_reconciler.cli.main confirm list --status pending
+# 7. ⭐ 日常流程：先 lock，再操作，再释放
+#    把下面的 <PID> 替换成你自己 status 里看到的数字
+python -m invoice_reconciler.cli.main lock acquire <PID> --operator lisi --reason "日常复核：与客户邮件核对"
+python -m invoice_reconciler.cli.main confirm show <PID>
+python -m invoice_reconciler.cli.main confirm approve <PID> --operator lisi --remark "核对无误"
+python -m invoice_reconciler.cli.main lock release <PID> --operator lisi
 
-# 8. 查看多候选
-python -m invoice_reconciler.cli.main confirm candidates
-
-# 9. 确认匹配
-python -m invoice_reconciler.cli.main confirm show 2
-python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
-
-# 10. 处理多候选
+# 8. 处理多候选（先锁 → 再选择收款 → 确认）
 python -m invoice_reconciler.cli.main confirm candidates --invoice-id 4
-python -m invoice_reconciler.cli.main confirm approve 3 --operator 张三 --select-payment 6 --remark "选择第二笔收款"
+# 假设候选列表中要选择的收款 ID 是 <PAY_ID>，对应匹配 ID 是 <PID_2>
+python -m invoice_reconciler.cli.main lock acquire <PID_2> --operator lisi --reason "多候选改配"
+python -m invoice_reconciler.cli.main confirm approve <PID_2> --operator lisi \
+    --select-payment <PAY_ID> --remark "选择与合同一致的那笔收款"
+python -m invoice_reconciler.cli.main lock release <PID_2> --operator lisi
 
-# 11. 人工匹配未匹配项
+# 9. 人工匹配未匹配项（先锁，或用 admin 直接跳过）
 python -m invoice_reconciler.cli.main list-unmatched --type invoices
 python -m invoice_reconciler.cli.main list-unmatched --type payments
-python -m invoice_reconciler.cli.main confirm manual 6 13 --operator 张三 --remark "手工匹配西安咨询公司"
+# 管理员 admin 可跳过锁直接操作
+python -m invoice_reconciler.cli.main confirm manual 6 13 --operator admin --remark "手工匹配西安咨询公司"
 
-# 12. 撤销错误匹配
+# 10. 撤销错误匹配（普通复核员需先锁自己的记录）
 python -m invoice_reconciler.cli.main revoke list
-python -m invoice_reconciler.cli.main revoke match 1 --operator 张三 --remark "日期不符，需重新核对"
+python -m invoice_reconciler.cli.main lock acquire 1 --operator zhangsan --reason "发现错误要撤销"
+python -m invoice_reconciler.cli.main revoke match 1 --operator zhangsan --remark "日期不符，需重新核对"
 
-# 13. 导出报告
-python -m invoice_reconciler.cli.main export full --operator 张三
-python -m invoice_reconciler.cli.main export diff --operator 张三
+# 11. 导出报告（JSON/CSV 均含 责任人/锁历史/接管原因/确认证据）
+python -m invoice_reconciler.cli.main export full --operator lisi --format json
+python -m invoice_reconciler.cli.main export full --operator lisi --format csv
 
-# 14. 测试断点恢复（重复导入）
-python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 李四
+# 12. 测试断点恢复：重复导入（去重，不会冲掉锁和历史）
+python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator lisi
 python -m invoice_reconciler.cli.main status
 ```
 
@@ -603,72 +722,116 @@ python -m invoice_reconciler.cli.main user info --username 张三
 | 批量解锁 | ❌ | ✅ |
 | 设置用户角色 | ❌ | ✅ |
 
-## 含工单流的完整验证命令链
+## 含工单流的完整验证命令链（从零开始可跑通）
 
-以下命令链从零开始，覆盖导入→匹配→锁定→确认→转交→接管→撤销→重做→导出→回放全流程，可实际跑通：
+以下命令链覆盖**导入→匹配→锁冲突→转交→接管→撤销→重做→导出→回放→重启恢复**全链路，可实际复制运行。
+关键：所有普通复核员操作**必须先 lock acquire**，示例中 `<PID>`、`<PID_2>` 请替换为 `status` 输出的真实待确认 ID。
 
 ```bash
-# ── 0. 清理旧数据（如需重新开始） ──
+# ── 0. 环境准备（清理旧库 + 验证依赖） ──
 Remove-Item -Recurse -Force invoice_reconciler\data\reconciler.db -ErrorAction SilentlyContinue
+python -c "import yaml, click, openpyxl; print('依赖检查通过')"
 
-# ── 1. 导入数据 ──
-python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 导入员
-python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sample_payments.csv --operator 导入员
+# ── 1. 导入 ──
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator importer
+python -m invoice_reconciler.cli.main import payments \
+    invoice_reconciler/data/sample_payments.csv --operator importer
 
 # ── 2. 自动匹配 ──
-python -m invoice_reconciler.cli.main match --operator 匹配员
+python -m invoice_reconciler.cli.main match --operator matcher
+#    输出 "待人工确认的匹配ID: M..., M..."
 
-# ── 3. 查看状态 ──
+# ── 3. 查看状态，记录待确认的前 2 个 ID（<PID> 和 <PID_2>） ──
 python -m invoice_reconciler.cli.main status
+#    例如：8 (INV004 多候选)、9 (INV005 模糊)
 
-# ── 4. 确认匹配（确认时自动锁定给操作者） ──
-python -m invoice_reconciler.cli.main confirm list --status pending
-python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
+# ── 4. ⭐ 严格先锁再确认（普通复核员 reviewer_a） ──
+#    ❌ 先演示：不锁直接确认 → 被拒绝（核心规则验证）
+python -m invoice_reconciler.cli.main confirm approve <PID> \
+    --operator reviewer_a --remark "XXX"
+#    预期：[!!] 该记录未被锁定，请先执行 'lock acquire' 锁定后再操作
 
-# ── 5. 手动锁定一条记录 ──
-python -m invoice_reconciler.cli.main lock acquire 1 --operator 李四 --reason "开始复核"
+#    ✅ 正确：先 lock，再 confirm
+python -m invoice_reconciler.cli.main lock acquire <PID> \
+    --operator reviewer_a --reason "与客户核对中"
+python -m invoice_reconciler.cli.main confirm show <PID>
+python -m invoice_reconciler.cli.main confirm approve <PID> \
+    --operator reviewer_a --remark "与客户邮件核对一致"
+python -m invoice_reconciler.cli.main lock release <PID> --operator reviewer_a
 
-# ── 6. 查看锁定列表 ──
-python -m invoice_reconciler.cli.main lock list
+# ── 5. 锁冲突：同一条记录不能两人同时锁 ──
+python -m invoice_reconciler.cli.main lock acquire <PID_2> \
+    --operator reviewer_a --reason "reviewer_a 先抢到"
+python -m invoice_reconciler.cli.main lock acquire <PID_2> \
+    --operator reviewer_b --reason "reviewer_b 也想抢"
+#    预期：[!!] 记录已被 reviewer_a 锁定
 
-# ── 7. 转交锁给其他人 ──
-python -m invoice_reconciler.cli.main lock transfer 1 王五 --operator 李四 --reason "转交王五处理"
+# ── 6. 转交锁：reviewer_a → reviewer_b ──
+python -m invoice_reconciler.cli.main lock transfer <PID_2> reviewer_b \
+    --operator reviewer_a --reason "reviewer_a 临时有事，转交 reviewer_b 继续"
+python -m invoice_reconciler.cli.main lock list --owner reviewer_b
+python -m invoice_reconciler.cli.main lock history --match-id <PID_2>
+#    历史可见：锁定(reviewer_a) → 转交(reviewer_a→reviewer_b)
 
-# ── 8. 查看锁操作历史 ──
-python -m invoice_reconciler.cli.main lock history --match-id 1
+# ── 7. 接管过期锁（模拟：reviewer_b 锁定后不处理） ──
+#    方式A：等配置 lock_timeout_seconds（默认 3600s）后自动过期
+#    方式B：管理员直接强制解锁再重新分配
+python -m invoice_reconciler.cli.main lock force-unlock <PID_2> \
+    --operator admin --reason "reviewer_b 请假，管理员强制释放"
+python -m invoice_reconciler.cli.main lock takeover <PID_2> \
+    --operator reviewer_c --reason "原锁被管理员释放，reviewer_c 接管重做"
 
-# ── 9. 查看用户信息 ──
-python -m invoice_reconciler.cli.main user info --username 李四
+# ── 8. 接管后撤销：旧的锁历史/状态历史不会被冲掉 ──
+python -m invoice_reconciler.cli.main revoke match <PID_2> \
+    --operator reviewer_c --remark "接管后发现该笔对不上，撤销"
+python -m invoice_reconciler.cli.main lock history --match-id <PID_2>
+#    历史仍保留 reviewer_a → reviewer_b → admin(force_unlock) → reviewer_c(takeover) 完整链条
 
-# ── 10. 创建快照（包含锁信息） ──
-python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "复核中快照"
-
-# ── 11. 导出快照（JSON 格式，含责任人、锁历史、接管原因、确认证据） ──
-python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format json
-
-# ── 12. 回放校验 ──
-python -m invoice_reconciler.cli.main review replay --snapshot-no R202606180001
-
-# ── 13. 管理员强制解锁 ──
-python -m invoice_reconciler.cli.main lock force-unlock 1 --operator admin --reason "管理员强制释放"
-
-# ── 14. 管理员批量解锁 ──
-python -m invoice_reconciler.cli.main lock batch-unlock --operator admin --reason "批量释放所有锁"
-
-# ── 15. 撤销匹配（操作者需为锁持有人或管理员） ──
-python -m invoice_reconciler.cli.main revoke match 1 --operator 张三 --remark "匹配有误，需重新核对"
-
-# ── 16. 人工重新匹配 ──
+# ── 9. 撤销后重做：新创建的匹配记录与旧记录 ID 不同，历史完全独立 ──
 python -m invoice_reconciler.cli.main list-unmatched --type invoices
-python -m invoice_reconciler.cli.main list-unmatched --type payments
-python -m invoice_reconciler.cli.main confirm manual 1 1 --operator 张三 --remark "重新人工匹配"
+#    选一个未匹配发票和收款 ID，比如发票 6 和收款 13
+python -m invoice_reconciler.cli.main confirm manual 6 13 \
+    --operator admin --remark "撤销后重新人工匹配，admin 可跳过锁"
 
-# ── 17. 导出完整报告（含锁信息） ──
-python -m invoice_reconciler.cli.main export full --operator 张三 --format json
+# ── 10. 跨重启恢复：模拟关闭程序再打开（实际关不关闭都一样，DB 持久化） ──
+#     锁状态、锁历史、状态历史全部存在 SQLite，重启后自动恢复
+python -m invoice_reconciler.cli.main lock list --all
+#     启动会打印：[锁状态恢复] 共 N 条锁，其中已过期 X 条。配置超时: 3600 秒
 
-# ── 18. 导入旧批次（不会冲掉已有锁和历史） ──
-python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 导入员
+# ── 11. 创建快照（包含当时所有锁信息和确认证据） ──
+python -m invoice_reconciler.cli.main review snapshot create \
+    --operator reviewer_c --description "第一轮复核 + 接管撤销完成"
+#    记下快照编号 <SNAP>，如 R202606180001
 
-# ── 19. 运行测试 ──
+# ── 12. 导出：JSON / CSV 均含 责任人/锁历史/接管原因/最后确认证据 ──
+python -m invoice_reconciler.cli.main export full --operator reviewer_c --format json
+python -m invoice_reconciler.cli.main export full --operator reviewer_c --format csv
+python -m invoice_reconciler.cli.main export snapshot \
+    --snapshot-no <SNAP> --operator reviewer_c --format json
+
+# ── 13. 回放校验 ──
+python -m invoice_reconciler.cli.main review replay --snapshot-no <SNAP>
+
+# ── 14. 管理员操作：批量解锁所有用户的所有锁 ──
+python -m invoice_reconciler.cli.main lock list --all
+python -m invoice_reconciler.cli.main lock batch-unlock \
+    --operator admin --reason "对账周期结束，批量释放所有锁"
+python -m invoice_reconciler.cli.main lock list --all
+
+# ── 15. 导入旧批次：跳过重复导入，不冲掉锁和历史 ──
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator importer
+#    输出：文件已导入，批次ID: x，跳过重复导入
+
+# ── 16. 运行测试套件（36+ workflow 测试 + 25 CLI 测试） ──
 python -m unittest discover -s tests -v
 ```
+
+> **运行结果自检清单**：运行后依次核对
+> 1. 第4步不锁直接 confirm 被拒 ✅
+> 2. 第5步 zhangsan/lisi 锁冲突被拒 ✅
+> 3. 第8步撤销后 `lock history` 仍能看到最早的 reviewer_a 操作 ✅
+> 4. 第12步导出 JSON 中能看到"锁历史"/"接管原因"/"最后确认证据"字段 ✅
+> 5. 第13步 replay 输出包含"一致"或"差异"字样 ✅
+> 6. 第16步所有测试显示 `OK` ✅

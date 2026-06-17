@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import csv
 import tempfile
 import unittest
 import shutil
@@ -601,6 +602,480 @@ class TestExportAndReplay(unittest.TestCase):
 
         history_after = self.db.get_lock_history(match_id=match_id)
         self.assertEqual(len(history_after), len(history_before))
+
+
+class TestStrictLockBeforeOperate(unittest.TestCase):
+    """测试严格的先锁再处理机制"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin_user"],
+            enable_lock=True,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.revoker = Revoker(self.db, self.config, self.workflow)
+
+        self.importer.import_invoices(self.invoice_csv, "init_user")
+        self.importer.import_payments(self.payment_csv, "init_user")
+        self.matcher.run_auto_matching("init_user")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_reviewer_cannot_confirm_unlocked_record(self):
+        """测试普通复核员不能确认未锁定的记录"""
+        pending = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if not pending:
+            matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+            match_id = matched[0]["id"]
+            with self.assertRaises(ValueError) as ctx:
+                self.matcher.confirm_match(match_id, "reviewer_x", "尝试不锁定确认")
+            self.assertIn("锁定", str(ctx.exception))
+            self.assertIn("lock acquire", str(ctx.exception))
+        else:
+            match_id = pending[0]["id"]
+            with self.assertRaises(ValueError) as ctx:
+                self.matcher.confirm_match(match_id, "reviewer_x", "尝试不锁定确认")
+            self.assertIn("锁定", str(ctx.exception))
+
+    def test_reviewer_cannot_reject_unlocked_record(self):
+        """测试普通复核员不能拒绝未锁定的记录"""
+        pending = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if pending:
+            match_id = pending[0]["id"]
+            with self.assertRaises(ValueError) as ctx:
+                self.matcher.reject_match(match_id, "reviewer_x", "不锁定就拒绝")
+            self.assertIn("锁定", str(ctx.exception))
+
+    def test_reviewer_cannot_revoke_unlocked_record(self):
+        """测试普通复核员不能撤销未锁定的已确认记录"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        self.assertGreater(len(matched), 0)
+        match_id = matched[0]["id"]
+
+        result = self.revoker.revoke_match(match_id, "reviewer_x", "不锁定就撤销")
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "lock_violation")
+        self.assertIn("锁定", result["message"])
+
+    def test_locked_then_confirm_success(self):
+        """测试锁定后确认成功"""
+        pending = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if pending:
+            match_id = pending[0]["id"]
+            self.workflow.acquire_lock(match_id, "reviewer_ok", "开始复核")
+            result = self.matcher.confirm_match(match_id, "reviewer_ok", "锁定后确认")
+            self.assertTrue(result["success"])
+
+            m = self.db.get_match_by_id(match_id)
+            self.assertEqual(m["status"], MATCH_STATUS_MATCHED)
+            self.assertEqual(m["operator"], "reviewer_ok")
+
+            lock = self.db.get_match_lock(match_id)
+            self.assertIsNotNone(lock)
+            self.assertEqual(lock["lock_owner"], "reviewer_ok")
+
+    def test_locked_then_reject_success(self):
+        """测试锁定后拒绝成功"""
+        pending = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if pending:
+            match_id = pending[0]["id"]
+            self.workflow.acquire_lock(match_id, "reviewer_ok", "开始复核")
+            result = self.matcher.reject_match(match_id, "reviewer_ok", "锁定后拒绝")
+            self.assertTrue(result["success"])
+
+            m = self.db.get_match_by_id(match_id)
+            self.assertEqual(m["status"], MATCH_STATUS_EXCEPTION)
+
+    def test_locked_then_revoke_success(self):
+        """测试锁定后撤销成功"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        self.assertGreater(len(matched), 0)
+        match_id = matched[0]["id"]
+
+        self.workflow.acquire_lock(match_id, "reviewer_ok", "锁定准备撤销")
+        result = self.revoker.revoke_match(match_id, "reviewer_ok", "锁定后撤销")
+        self.assertTrue(result["success"])
+
+        m = self.db.get_match_by_id(match_id)
+        self.assertEqual(m["status"], MATCH_STATUS_REVOKED)
+
+    def test_admin_bypass_lock_for_confirm(self):
+        """测试管理员可以跳过锁确认"""
+        pending = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if pending:
+            match_id = pending[0]["id"]
+            self.workflow.acquire_lock(match_id, "other_reviewer", "其他人锁定")
+            result = self.matcher.confirm_match(match_id, "admin_user", "管理员跳过锁")
+            self.assertTrue(result["success"])
+
+    def test_admin_bypass_lock_for_revoke(self):
+        """测试管理员可以跳过锁撤销"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        self.assertGreater(len(matched), 0)
+        match_id = matched[0]["id"]
+
+        self.workflow.acquire_lock(match_id, "other_reviewer", "其他人锁定")
+        result = self.revoker.revoke_match(match_id, "admin_user", "管理员撤销")
+        self.assertTrue(result["success"])
+
+
+class TestTakeoverRevokePreserveHistory(unittest.TestCase):
+    """测试接管后撤销重做不冲掉历史"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin_user"],
+            enable_lock=True,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.revoker = Revoker(self.db, self.config, self.workflow)
+
+        self.importer.import_invoices(self.invoice_csv, "init_user")
+        self.importer.import_payments(self.payment_csv, "init_user")
+        self.matcher.run_auto_matching("init_user")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_takeover_then_revoke_preserves_lock_history(self):
+        """测试接管后撤销，锁历史保留"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        match_id = matched[0]["id"]
+        invoice_id = matched[0]["invoice_id"]
+        payment_id = matched[0]["payment_id"]
+
+        self.workflow.acquire_lock(match_id, "user_a", "用户A锁定处理")
+
+        with self.db._get_conn() as conn:
+            past = (datetime.now() - timedelta(seconds=7200)).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE match_locks SET locked_at = ?, lock_expires_at = ? WHERE match_id = ?",
+                (past, past, match_id)
+            )
+
+        history_before = self.db.get_lock_history(match_id=match_id)
+        actions_before = [h["action"] for h in history_before]
+
+        self.workflow.takeover_lock(match_id, "user_b", "接管过期锁处理")
+        self.revoker.revoke_match(match_id, "user_b", "接管后发现错误，撤销")
+
+        history_after = self.db.get_lock_history(match_id=match_id)
+        actions_after = [h["action"] for h in history_after]
+
+        for a in actions_before:
+            self.assertIn(a, actions_after)
+
+        self.assertIn("takeover", actions_after)
+        self.assertIn("unlock", actions_after)
+
+        operators_after = [h["operator"] for h in history_after]
+        self.assertIn("user_a", operators_after)
+        self.assertIn("user_b", operators_after)
+
+    def test_reconfirm_after_takeover_revoke_preserves_old_history(self):
+        """测试接管撤销后重新确认，旧历史不冲掉"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        match_id = matched[0]["id"]
+        invoice_id = matched[0]["invoice_id"]
+        payment_id = matched[0]["payment_id"]
+        old_match_no = matched[0]["match_no"]
+
+        self.workflow.acquire_lock(match_id, "user_a", "初始锁定")
+        with self.db._get_conn() as conn:
+            past = (datetime.now() - timedelta(seconds=7200)).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE match_locks SET locked_at = ?, lock_expires_at = ? WHERE match_id = ?",
+                (past, past, match_id)
+            )
+
+        old_status_history = self.db.get_status_history(match_id=match_id)
+
+        self.workflow.takeover_lock(match_id, "user_b", "用户B接管")
+        self.revoker.revoke_match(match_id, "user_b", "用户B撤销")
+
+        old_lock_history = self.db.get_lock_history(match_id=match_id)
+        old_lock_actions = [h["action"] for h in old_lock_history]
+
+        new_result = self.matcher.manual_match(
+            invoice_id, payment_id, "user_c", "用户C重做确认"
+        )
+        new_match = self.db.get_match_by_no(new_result["match_no"])
+
+        status_history = self.db.get_status_history(match_id=match_id)
+        self.assertEqual(len(status_history), len(old_status_history) + 1)
+
+        lock_history = self.db.get_lock_history(match_id=match_id)
+        lock_actions = [h["action"] for h in lock_history]
+        for a in old_lock_actions:
+            self.assertIn(a, lock_actions)
+
+        new_lock_history = self.db.get_lock_history(match_id=new_match["id"])
+        self.assertGreaterEqual(len(new_lock_history), 1)
+        lock_owners_new = [h["new_owner"] for h in new_lock_history if h.get("new_owner")]
+        self.assertIn("user_c", lock_owners_new)
+
+
+class TestExportContainsLockInfo(unittest.TestCase):
+    """测试导出包含完整锁信息"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+        os.makedirs(self.export_dir, exist_ok=True)
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=True,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.exporter = ReportExporter(self.config, self.db)
+        self.reviewer = ReviewSnapshot(self.db)
+
+        self.importer.import_invoices(self.invoice_csv, "init_user")
+        self.importer.import_payments(self.payment_csv, "init_user")
+        self.matcher.run_auto_matching("init_user")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_json_export_contains_lock_history_and_evidence(self):
+        """测试 JSON 完整导出包含锁历史、接管原因、确认证据"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        self.assertGreater(len(matched), 0)
+        match_id = matched[0]["id"]
+
+        self.workflow.acquire_lock(match_id, "user_a", "测试锁定")
+
+        result = self.exporter.export_full_report("operator_test", format="json")
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.exists(result["file_path"]))
+
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIn("已匹配", data)
+        self.assertGreater(len(data["已匹配"]), 0)
+
+        first_matched = data["已匹配"][0]
+        self.assertIn("当前责任人", first_matched)
+        self.assertIn("锁历史", first_matched)
+        self.assertIn("接管原因", first_matched)
+        self.assertIn("最后确认证据", first_matched)
+
+        self.assertEqual(first_matched["当前责任人"], "user_a")
+        self.assertIn("锁定", first_matched["锁历史"])
+        self.assertIn("确认人", first_matched["最后确认证据"])
+        self.assertIn("匹配类型", first_matched["最后确认证据"])
+
+    def test_csv_export_sheets_contain_lock_columns(self):
+        """测试 CSV 导出的各个 sheet 包含锁相关列"""
+        matched = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        self.assertGreater(len(matched), 0)
+        match_id = matched[0]["id"]
+        self.workflow.acquire_lock(match_id, "csv_user", "CSV测试锁定")
+
+        result = self.exporter.export_full_report("op_csv", format="csv")
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.isdir(result["file_path"]))
+
+        matched_csv = os.path.join(result["file_path"], "已匹配.csv")
+        self.assertTrue(os.path.exists(matched_csv))
+
+        with open(matched_csv, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            headers = reader.fieldnames or []
+
+        self.assertIn("当前责任人", headers)
+        self.assertIn("锁历史", headers)
+        self.assertIn("接管原因", headers)
+        self.assertIn("最后确认证据", headers)
+
+    def test_pending_export_contains_lock_info(self):
+        """测试待确认导出也包含锁信息"""
+        pending = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if pending:
+            match_id = pending[0]["id"]
+            self.workflow.acquire_lock(match_id, "pending_user", "待确认锁定")
+
+        result = self.exporter.export_full_report("op_pending", format="json")
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if "待确认" in data and len(data["待确认"]) > 0:
+            first_pending = data["待确认"][0]
+            self.assertIn("当前责任人", first_pending)
+            self.assertIn("锁历史", first_pending)
+            self.assertIn("接管原因", first_pending)
+            self.assertIn("最后确认证据", first_pending)
+
+
+class TestStartupRestoresLockConfig(unittest.TestCase):
+    """测试程序启动后按配置恢复锁状态"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_restart_refreshes_expire_time_from_config(self):
+        """测试重启后根据配置刷新锁过期时间"""
+        config_short = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=60,
+            admin_users=["admin"],
+            enable_lock=True,
+        )
+
+        db1 = Database(self.db_path)
+        wf1 = WorkflowManager(config_short, db1)
+        imp = CSVImporter(config_short, db1)
+        mch = MatchEngine(config_short, db1, wf1)
+
+        imp.import_invoices(self.invoice_csv, "u1")
+        imp.import_payments(self.payment_csv, "u1")
+        mch.run_auto_matching("u1")
+
+        matched = db1.get_matches_by_status(MATCH_STATUS_MATCHED)
+        match_id = matched[0]["id"]
+
+        wf1.acquire_lock(match_id, "user_1", "短超时锁")
+
+        lock_before = db1.get_match_lock(match_id)
+        locked_at = datetime.strptime(lock_before["locked_at"], "%Y-%m-%d %H:%M:%S")
+        old_expires = datetime.strptime(lock_before["lock_expires_at"], "%Y-%m-%d %H:%M:%S")
+        expected_old_expires = locked_at + timedelta(seconds=60)
+        self.assertEqual((old_expires - locked_at).total_seconds(), 60)
+
+        del db1
+        del wf1
+
+        config_long = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=7200,
+            admin_users=["admin"],
+            enable_lock=True,
+        )
+
+        db2 = Database(self.db_path)
+        wf2 = WorkflowManager(config_long, db2)
+        restore_result = wf2.restore_locks_on_startup()
+
+        self.assertTrue(restore_result["restored"])
+        self.assertGreaterEqual(restore_result["total_locks"], 1)
+        self.assertEqual(restore_result["config_timeout"], 7200)
+
+        lock_after = db2.get_match_lock(match_id)
+        new_expires = datetime.strptime(lock_after["lock_expires_at"], "%Y-%m-%d %H:%M:%S")
+        expected_new_expires = locked_at + timedelta(seconds=7200)
+        self.assertEqual((new_expires - locked_at).total_seconds(), 7200)
+
+        self.assertGreater(new_expires, old_expires)
+
+    def test_restart_reports_correct_expired_count(self):
+        """测试重启后正确报告过期锁数量"""
+        config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=True,
+        )
+
+        db1 = Database(self.db_path)
+        wf1 = WorkflowManager(config, db1)
+        imp = CSVImporter(config, db1)
+        mch = MatchEngine(config, db1, wf1)
+
+        imp.import_invoices(self.invoice_csv, "u1")
+        imp.import_payments(self.payment_csv, "u1")
+        mch.run_auto_matching("u1")
+
+        matched = db1.get_matches_by_status(MATCH_STATUS_MATCHED)
+        self.assertGreaterEqual(len(matched), 2)
+
+        wf1.acquire_lock(matched[0]["id"], "user_a", "正常锁")
+        wf1.acquire_lock(matched[1]["id"], "user_b", "即将过期锁")
+
+        with db1._get_conn() as conn:
+            past = (datetime.now() - timedelta(seconds=7200)).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "UPDATE match_locks SET locked_at = ?, lock_expires_at = ? WHERE lock_owner = ?",
+                (past, past, "user_b")
+            )
+
+        del db1
+        del wf1
+
+        db2 = Database(self.db_path)
+        wf2 = WorkflowManager(config, db2)
+        restore = wf2.restore_locks_on_startup()
+
+        self.assertEqual(restore["total_locks"], 2)
+        self.assertEqual(restore["expired_locks"], 1)
 
 
 if __name__ == "__main__":

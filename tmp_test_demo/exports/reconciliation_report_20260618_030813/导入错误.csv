@@ -1,0 +1,7 @@
+﻿错误ID,批次ID,文件类型,文件名,文件行号,错误类型,错误信息,原始数据,发生时间
+1,1,发票,sample_invoices.csv,8,missing_required,缺少必填字段: customer,"{""invoice_no"": ""INV007"", ""invoice_date"": ""2024-03-10"", ""customer"": """", ""amount"": ""7800.00"", ""status"": ""normal"", ""remark"": ""缺客户-错误行""}",2026-06-17 19:06:21
+2,1,发票,sample_invoices.csv,9,invalid_amount,金额格式错误: abc,"{""invoice_no"": ""INV008"", ""invoice_date"": ""2024-03-15"", ""customer"": ""武汉制造公司"", ""amount"": ""abc"", ""status"": ""normal"", ""remark"": ""金额非法-错误行""}",2026-06-17 19:06:21
+3,1,发票,sample_invoices.csv,14,invalid_date,日期格式错误: invalid_date，请使用 YYYY-MM-DD 或 YYYY/MM/DD 格式,"{""invoice_no"": ""INV013"", ""invoice_date"": ""invalid_date"", ""customer"": ""重庆医药公司"", ""amount"": ""7200.00"", ""status"": ""normal"", ""remark"": ""日期格式错误""}",2026-06-17 19:06:21
+4,1,发票,sample_invoices.csv,16,invalid_amount,金额非法: -500.00，必须为正数,"{""invoice_no"": ""INV015"", ""invoice_date"": ""2024-05-10"", ""customer"": ""青岛食品公司"", ""amount"": ""-500.00"", ""status"": ""normal"", ""remark"": ""金额负数-错误行""}",2026-06-17 19:06:21
+5,2,收款,sample_payments.csv,15,missing_required,缺少必填字段: customer,"{""payment_no"": ""PAY014"", ""payment_date"": ""2024-06-10"", ""customer"": """", ""amount"": ""5000.00"", ""remark"": ""缺客户-错误行""}",2026-06-17 19:06:22
+6,2,收款,sample_payments.csv,16,invalid_amount,金额格式错误: invalid,"{""payment_no"": ""PAY015"", ""payment_date"": ""2024-06-15"", ""customer"": ""长沙电子公司"", ""amount"": ""invalid"", ""remark"": ""金额非法-错误行""}",2026-06-17 19:06:22
