@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "invoice-reconciler"
+version = "1.0.0"
+description = "Offline invoice and payment reconciliation CLI tool"
+requires-python = ">=3.8"
+dependencies = [
+    "click>=8.0.0",
+    "PyYAML>=6.0",
+    "openpyxl>=3.0.0",
+]
+
+[project.scripts]
+invoice-reconciler = "invoice_reconciler.cli.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["invoice_reconciler*"]
