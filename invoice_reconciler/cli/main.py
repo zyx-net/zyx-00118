@@ -42,6 +42,12 @@ from invoice_reconciler.core.batch_workbench import (
     BatchWorkbench,
     CONFLICT_TYPE_LABELS,
 )
+from invoice_reconciler.core.change_tracker import (
+    ChangeTracker,
+    CHANGE_TYPE_LABELS,
+    IMPACT_TYPE_LABELS,
+    PROCESSING_STATUS_LABELS,
+)
 
 
 def get_current_user() -> str:
@@ -110,6 +116,40 @@ def cli(ctx, config_path):
                         fg="yellow"
                     ))
 
+        last_export = workbench.get_last_export_context()
+        if last_export:
+            click.echo(click.style(
+                f"[会话恢复] 上次导出: 批次 #{last_export['batch_id']} - "
+                f"{last_export.get('file_name', '-')} ({last_export['export_type']}, {last_export['format']})",
+                fg="yellow"
+            ))
+            if last_export.get("exported_at"):
+                click.echo(click.style(
+                    f"[会话恢复] 导出时间: {last_export['exported_at']}",
+                    fg="yellow"
+                ))
+
+        last_view = workbench.get_last_change_view_context()
+        if last_view:
+            parts = []
+            if last_view.get("batch_id"):
+                parts.append(f"批次 #{last_view['batch_id']}")
+            if last_view.get("change_type"):
+                ct_label = CHANGE_TYPE_LABELS.get(last_view['change_type'], last_view['change_type'])
+                parts.append(f"变更类型: {ct_label}")
+            if last_view.get("impact_type"):
+                it_label = IMPACT_TYPE_LABELS.get(last_view['impact_type'], last_view['impact_type'])
+                parts.append(f"影响类型: {it_label}")
+            if last_view.get("processing_status"):
+                ps_label = PROCESSING_STATUS_LABELS.get(last_view['processing_status'],
+                                                        last_view['processing_status'])
+                parts.append(f"处理状态: {ps_label}")
+            if parts:
+                click.echo(click.style(
+                    f"[会话恢复] 上次查看变更: {', '.join(parts)}",
+                    fg="yellow"
+                ))
+
         ctx.obj = {
             "config": config,
             "db": db,
@@ -120,6 +160,7 @@ def cli(ctx, config_path):
             "exporter": ReportExporter(config, db),
             "reviewer": ReviewSnapshot(db),
             "workbench": workbench,
+            "change_tracker": ChangeTracker(config, db),
         }
     except Exception as e:
         click.echo(f"初始化失败: {e}", err=True)
@@ -221,6 +262,24 @@ def import_invoices(ctx, file_path, operator, preview):
                 record_type = "发票" if c["record_type"] == "invoice" else "收款"
                 click.echo(f"  • [{c_type}] {record_type} {c['record_no']}: {c['conflict_reason']}")
             click.echo(click.style("详细冲突信息已记录到数据库，可通过 `batch conflicts` 命令查看", fg="yellow"))
+
+        if result.get("change_count", 0) > 0:
+            click.echo()
+            click.echo(click.style(f"📋 追踪到 {result['change_count']} 条变更记录:", fg="cyan", bold=True))
+            for ct, count in result.get("changes_by_type", {}).items():
+                ct_label = CHANGE_TYPE_LABELS.get(ct, ct)
+                click.echo(f"  • {ct_label}: {count} 条")
+
+            if result.get("impact_summary"):
+                click.echo()
+                click.echo(click.style("🔍 影响分析:", fg="magenta", bold=True))
+                for it, count in result["impact_summary"].items():
+                    if count > 0:
+                        it_label = IMPACT_TYPE_LABELS.get(it, it)
+                        click.echo(f"  • {it_label}: {count} 条")
+
+            click.echo(click.style("详细变更日志已记录，可通过 `batch changes` 命令查看", fg="cyan"))
+            click.echo(click.style("导出变更日志: `batch export-changes <batch_id>`", fg="cyan"))
     except Exception as e:
         click.echo(click.style(f"导入失败: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -268,6 +327,24 @@ def import_payments(ctx, file_path, operator, preview):
                 record_type = "发票" if c["record_type"] == "invoice" else "收款"
                 click.echo(f"  • [{c_type}] {record_type} {c['record_no']}: {c['conflict_reason']}")
             click.echo(click.style("详细冲突信息已记录到数据库，可通过 `batch conflicts` 命令查看", fg="yellow"))
+
+        if result.get("change_count", 0) > 0:
+            click.echo()
+            click.echo(click.style(f"📋 追踪到 {result['change_count']} 条变更记录:", fg="cyan", bold=True))
+            for ct, count in result.get("changes_by_type", {}).items():
+                ct_label = CHANGE_TYPE_LABELS.get(ct, ct)
+                click.echo(f"  • {ct_label}: {count} 条")
+
+            if result.get("impact_summary"):
+                click.echo()
+                click.echo(click.style("🔍 影响分析:", fg="magenta", bold=True))
+                for it, count in result["impact_summary"].items():
+                    if count > 0:
+                        it_label = IMPACT_TYPE_LABELS.get(it, it)
+                        click.echo(f"  • {it_label}: {count} 条")
+
+            click.echo(click.style("详细变更日志已记录，可通过 `batch changes` 命令查看", fg="cyan"))
+            click.echo(click.style("导出变更日志: `batch export-changes <batch_id>`", fg="cyan"))
     except Exception as e:
         click.echo(click.style(f"导入失败: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -1624,7 +1701,16 @@ def batch_reminders(ctx, batch_id):
 def batch_export_progress(ctx, batch_id, operator, export_format):
     """一键导出当前批次进度（含冲突和差异）"""
     exporter = ctx.obj["exporter"]
+    workbench = ctx.obj["workbench"]
     operator = operator or get_current_user()
+
+    workbench.save_last_selected_batch(batch_id, operator)
+    workbench.save_export_context(
+        batch_id=batch_id,
+        export_type="batch_progress",
+        format=export_format or workbench.config.export_format,
+        operator=operator,
+    )
 
     click.echo(f"正在导出批次 #{batch_id} 进度...")
     result = exporter.export_batch_progress(batch_id, operator, format=export_format)
@@ -1727,6 +1813,209 @@ def batch_clear_state(ctx):
     workbench = ctx.obj["workbench"]
     workbench.clear_workbench_state()
     click.echo(click.style("[OK] 已清除会话状态，下次启动将不会恢复", fg="green"))
+
+
+@batch.command("changes")
+@click.option("--batch-id", type=int, default=None, help="指定批次ID，默认显示所有批次")
+@click.option("--change-type", default=None,
+              type=click.Choice(["new_record", "status_change", "amount_change",
+                                 "key_field_change", "duplicate_process"]),
+              help="按变更类型过滤")
+@click.option("--impact-type", default=None,
+              type=click.Choice(["none", "affects_pending", "affects_confirmed",
+                                 "affects_revoked", "warning", "critical"]),
+              help="按影响类型过滤")
+@click.option("--status", "processing_status", default=None,
+              type=click.Choice(["pending", "reviewed", "resolved", "ignored"]),
+              help="按处理状态过滤")
+@click.option("--record-no", default=None, help="按记录编号过滤")
+@click.pass_context
+def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, record_no):
+    """查看批次变更日志明细"""
+    tracker = ctx.obj["change_tracker"]
+    db = ctx.obj["db"]
+
+    if batch_id:
+        workbench = ctx.obj["workbench"]
+        workbench.save_last_selected_batch(batch_id, get_current_user())
+
+    workbench.save_change_view_context(
+        batch_id=batch_id,
+        change_type=change_type,
+        impact_type=impact_type,
+        processing_status=processing_status,
+        operator=get_current_user(),
+    )
+
+    logs = db.get_batch_change_logs(
+        batch_id=batch_id,
+        change_type=change_type,
+        impact_type=impact_type,
+        processing_status=processing_status,
+        record_no=record_no,
+    )
+
+    if not logs:
+        click.echo(click.style("[OK] 未检测到变更记录", fg="green"))
+        return
+
+    summary = tracker.get_change_summary(batch_id=batch_id)
+    click.echo(click.style(f"📋 共 {len(logs)} 条变更记录", fg="cyan", bold=True))
+    click.echo()
+    click.echo(click.style("=== 变更统计 ===", fg="cyan"))
+    for ct, count in summary["by_type"].items():
+        click.echo(f"  {CHANGE_TYPE_LABELS.get(ct, ct)}: {count}")
+    click.echo()
+    click.echo(click.style("=== 影响统计 ===", fg="magenta"))
+    for it, count in summary["by_impact"].items():
+        if count > 0:
+            click.echo(f"  {IMPACT_TYPE_LABELS.get(it, it)}: {count}")
+    click.echo()
+    click.echo(click.style("=== 处理状态 ===", fg="yellow"))
+    for ps, count in summary["by_status"].items():
+        click.echo(f"  {PROCESSING_STATUS_LABELS.get(ps, ps)}: {count}")
+    click.echo()
+
+    headers = ["ID", "批次", "变更类型", "记录类型", "记录编号",
+               "影响类型", "处理状态", "变更摘要", "检测时间"]
+    rows = []
+    for log in logs:
+        rows.append([
+            log["id"],
+            log["batch_id"],
+            CHANGE_TYPE_LABELS.get(log["change_type"], log["change_type"]),
+            "发票" if log["record_type"] == "invoice" else "收款",
+            log["record_no"],
+            IMPACT_TYPE_LABELS.get(log["impact_type"] or "none", log["impact_type"] or "none"),
+            PROCESSING_STATUS_LABELS.get(log["processing_status"] or "pending",
+                                        log["processing_status"] or "pending"),
+            (log["change_summary"] or "")[:40],
+            log["detected_at"],
+        ])
+    print_table(headers, rows[:20])
+    if len(logs) > 20:
+        click.echo(f"\n... 还有 {len(logs) - 20} 条，使用 `batch export-changes` 导出完整明细")
+
+    click.echo()
+    click.echo("变更说明:")
+    click.echo("  • 新增记录: 本次导入新增的记录，之前批次中不存在")
+    click.echo("  • 状态变更: 同一记录在不同批次中的状态不一致")
+    click.echo("  • 金额变更: 同一记录在不同批次中的金额不一致")
+    click.echo("  • 关键字段变更: 客户、日期等关键字段发生变化")
+    click.echo("  • 重复处理: 同一记录被不同操作者处理")
+
+
+@batch.command("export-changes")
+@click.argument("batch_id", type=int)
+@click.option("--operator", default=None, help="当前操作者")
+@click.option("--format", "export_format", type=click.Choice(["json", "csv"]),
+              default="json", help="导出格式，默认JSON")
+@click.pass_context
+def batch_export_changes(ctx, batch_id, operator, export_format):
+    """导出批次变更日志（JSON或CSV格式）"""
+    tracker = ctx.obj["change_tracker"]
+    workbench = ctx.obj["workbench"]
+    operator = operator or get_current_user()
+
+    workbench.save_last_selected_batch(batch_id, operator)
+    workbench.save_export_context(
+        batch_id=batch_id,
+        export_type="change_logs",
+        format=export_format,
+        operator=operator,
+    )
+
+    click.echo(f"正在导出批次 #{batch_id} 变更日志...")
+    result = tracker.export_change_logs(batch_id, operator, format=export_format)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 变更日志已导出: {result['file_path']}", fg="green"))
+    click.echo(f"格式: {result['format']}")
+    click.echo(f"总变更数: {result['total_changes']}")
+    click.echo(f"生成时间: {result['generated_at']}")
+    click.echo()
+    click.echo("导出摘要:")
+    click.echo("  按变更类型:")
+    for ct, count in result["summary"]["by_type"].items():
+        click.echo(f"    {CHANGE_TYPE_LABELS.get(ct, ct)}: {count}")
+    click.echo("  按影响类型:")
+    for it, count in result["summary"]["by_impact"].items():
+        if count > 0:
+            click.echo(f"    {IMPACT_TYPE_LABELS.get(it, it)}: {count}")
+    click.echo("  按处理状态:")
+    for ps, count in result["summary"]["by_status"].items():
+        click.echo(f"    {PROCESSING_STATUS_LABELS.get(ps, ps)}: {count}")
+
+
+@batch.command("change-status")
+@click.argument("log_id", type=int)
+@click.option("--status", "processing_status", required=True,
+              type=click.Choice(["pending", "reviewed", "resolved", "ignored"]),
+              help="设置处理状态")
+@click.option("--operator", default=None, help="当前操作者")
+@click.option("--remark", default=None, help="处理备注")
+@click.pass_context
+def batch_change_status(ctx, log_id, processing_status, operator, remark):
+    """更新变更日志处理状态"""
+    db = ctx.obj["db"]
+    operator = operator or get_current_user()
+
+    db.update_change_log_status(log_id, processing_status, operator, remark)
+
+    status_label = PROCESSING_STATUS_LABELS.get(processing_status, processing_status)
+    click.echo(click.style(f"[OK] 变更日志 #{log_id} 状态已更新为: {status_label}", fg="green"))
+    if remark:
+        click.echo(f"备注: {remark}")
+
+
+@batch.command("resume-export")
+@click.option("--operator", default=None, help="当前操作者")
+@click.pass_context
+def batch_resume_export(ctx, operator):
+    """使用上次导出上下文继续导出（程序重启后不丢失）"""
+    workbench = ctx.obj["workbench"]
+    tracker = ctx.obj["change_tracker"]
+    operator = operator or get_current_user()
+
+    last_context = workbench.get_last_export_context()
+    if not last_context:
+        click.echo(click.style("[!!] 没有可恢复的导出上下文", fg="yellow"), err=True)
+        click.echo("请先使用 `batch export-changes` 或 `batch export-progress` 进行导出")
+        return
+
+    batch_id = last_context["batch_id"]
+    export_type = last_context.get("export_type", "change_logs")
+    export_format = last_context.get("format", "json")
+
+    click.echo(click.style(f"[会话恢复] 使用上次导出上下文:", fg="cyan"))
+    click.echo(f"  批次: #{batch_id} - {last_context.get('file_name', '-')}")
+    click.echo(f"  导出类型: {export_type}")
+    click.echo(f"  格式: {export_format}")
+    if last_context.get("exported_at"):
+        click.echo(f"  上次导出时间: {last_context['exported_at']}")
+    click.echo()
+
+    if export_type == "change_logs":
+        click.echo(f"正在导出批次 #{batch_id} 变更日志...")
+        result = tracker.export_change_logs(batch_id, operator, format=export_format)
+    elif export_type == "batch_progress":
+        exporter = ctx.obj["exporter"]
+        click.echo(f"正在导出批次 #{batch_id} 进度...")
+        result = exporter.export_batch_progress(batch_id, operator, format=export_format)
+    else:
+        click.echo(click.style(f"[!!] 未知的导出类型: {export_type}", fg="red"), err=True)
+        return
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 导出已完成: {result['file_path']}", fg="green"))
+    click.echo(f"格式: {result['format']}")
+    click.echo(f"生成时间: {result['generated_at']}")
 
 
 @batch.command("list")

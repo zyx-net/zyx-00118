@@ -136,9 +136,15 @@ class CSVImporter:
             conflicts = self._detect_batch_conflicts(batch_id, file_type, operator)
             conflict_count = len(conflicts)
 
+            from .change_tracker import ChangeTracker
+            tracker = ChangeTracker(self.config, self.db)
+            change_result = tracker.detect_and_track_changes(batch_id, file_type, operator)
+
             message = f"导入完成：成功 {success_count} 条，失败 {failed_count} 条"
             if conflict_count > 0:
                 message += f"，检测到 {conflict_count} 个冲突"
+            if change_result["total_changes"] > 0:
+                message += f"，追踪到 {change_result['total_changes']} 条变更记录"
 
             return {
                 "success": True,
@@ -149,6 +155,10 @@ class CSVImporter:
                 "failed_rows": failed_count,
                 "conflict_count": conflict_count,
                 "conflicts": conflicts,
+                "change_count": change_result["total_changes"],
+                "changes_by_type": change_result["changes_by_type"],
+                "impact_summary": change_result["impact_summary"],
+                "change_log_ids": change_result["change_log_ids"],
                 "message": message
             }
 

@@ -1,0 +1,4 @@
+﻿payment_no,payment_date,customer,amount
+PAY-A,2024-06-01,Alpha Co,100.00
+PAY-B,2024-06-02,Beta LLC,201.00
+PAY-C,2024-06-03,Gamma Inc,300.00

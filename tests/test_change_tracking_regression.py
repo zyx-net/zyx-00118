@@ -1,0 +1,878 @@
+import os
+import sys
+import json
+import csv
+import tempfile
+import unittest
+import shutil
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from invoice_reconciler.core.config import Config
+from invoice_reconciler.core.database import (
+    Database,
+    MATCH_STATUS_MATCHED,
+    MATCH_STATUS_PENDING,
+    MATCH_STATUS_EXCEPTION,
+    MATCH_STATUS_REVOKED,
+)
+from invoice_reconciler.core.importer import CSVImporter
+from invoice_reconciler.core.matcher import MatchEngine
+from invoice_reconciler.core.revoker import Revoker
+from invoice_reconciler.core.exporter import ReportExporter
+from invoice_reconciler.core.workflow import WorkflowManager
+from invoice_reconciler.core.batch_workbench import (
+    BatchWorkbench,
+    SESSION_KEY_LAST_BATCH,
+    SESSION_KEY_FILTER_OPERATOR,
+)
+from invoice_reconciler.core.change_tracker import (
+    ChangeTracker,
+    CHANGE_TYPE_NEW_RECORD,
+    CHANGE_TYPE_STATUS_CHANGE,
+    CHANGE_TYPE_AMOUNT_CHANGE,
+    CHANGE_TYPE_KEY_FIELD_CHANGE,
+    CHANGE_TYPE_DUPLICATE_PROCESS,
+    CHANGE_TYPE_LABELS,
+    IMPACT_TYPE_NONE,
+    IMPACT_TYPE_PENDING,
+    IMPACT_TYPE_CONFIRMED,
+    IMPACT_TYPE_REVOKED,
+    IMPACT_TYPE_WARNING,
+    IMPACT_TYPE_CRITICAL,
+    IMPACT_TYPE_LABELS,
+    PROCESSING_STATUS_PENDING,
+    PROCESSING_STATUS_REVIEWED,
+    PROCESSING_STATUS_RESOLVED,
+    PROCESSING_STATUS_IGNORED,
+    PROCESSING_STATUS_LABELS,
+)
+
+
+SAMPLE_INVOICES_V1 = """invoice_no,invoice_date,customer,amount,status
+INV001,2024-01-15,北京科技有限公司,1000.00,正常
+INV002,2024-01-16,上海贸易公司,2500.50,正常
+INV003,2024-01-17,广州电子厂,3000.00,正常
+INV004,2024-01-18,深圳软件公司,1500.00,正常
+INV005,2024-01-19,杭州电商平台,800.00,正常
+"""
+
+SAMPLE_PAYMENTS_V1 = """payment_no,payment_date,customer,amount
+PAY001,2024-01-16,北京科技有限公司,1000.00
+PAY002,2024-01-17,上海贸易公司,2500.50
+PAY003,2024-01-18,广州电子厂,3000.00
+PAY004,2024-01-20,深圳软件公司,1499.99
+PAY005,2024-01-21,杭州电商平台,800.00
+"""
+
+SAMPLE_INVOICES_V2 = """invoice_no,invoice_date,customer,amount,status
+INV001,2024-01-15,北京科技有限公司,1000.00,正常
+INV002,2024-01-16,上海贸易公司,2500.50,作废
+INV003,2024-01-17,广州电子有限公司,3000.00,正常
+INV004,2024-01-18,深圳软件公司,1600.00,正常
+INV005,2024-01-19,杭州电商平台,800.00,正常
+INV006,2024-01-20,武汉科技公司,2000.00,正常
+"""
+
+SAMPLE_PAYMENTS_V2 = """payment_no,payment_date,customer,amount
+PAY001,2024-01-16,北京科技有限公司,1000.00
+PAY002,2024-01-17,上海贸易公司,2500.50
+PAY003,2024-01-18,广州电子有限公司,3000.00
+PAY004,2024-01-20,深圳软件公司,1499.99
+PAY005,2024-01-21,杭州电商平台,800.00
+PAY006,2024-01-22,武汉科技公司,2000.00
+"""
+
+
+class TestChangeTrackerCore(unittest.TestCase):
+    """测试变更追踪核心功能"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+        self.payment_v2 = os.path.join(self.test_dir, "payments_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+        with open(self.payment_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V2)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.tracker = ChangeTracker(self.config, self.db)
+        self.workbench = BatchWorkbench(self.config, self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_detect_new_records(self):
+        """测试检测新增记录"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        self.assertIn("change_count", result)
+        self.assertGreater(result["change_count"], 0)
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+        new_records = [c for c in changes if c["change_type"] == CHANGE_TYPE_NEW_RECORD]
+
+        self.assertTrue(any(c["record_no"] == "INV006" for c in new_records))
+
+        inv006 = next(c for c in new_records if c["record_no"] == "INV006")
+        self.assertIsNotNone(inv006["after_summary"])
+        self.assertIn("INV006", inv006["after_summary"])
+        self.assertIsNone(inv006["before_summary"])
+
+    def test_detect_status_changes(self):
+        """测试检测状态变更"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+        status_changes = [c for c in changes if c["change_type"] == CHANGE_TYPE_STATUS_CHANGE]
+
+        self.assertTrue(any(c["record_no"] == "INV002" for c in status_changes))
+
+        inv002 = next(c for c in status_changes if c["record_no"] == "INV002")
+        self.assertEqual(inv002["old_value"], "正常")
+        self.assertEqual(inv002["new_value"], "作废")
+        self.assertIsNotNone(inv002["before_summary"])
+        self.assertIsNotNone(inv002["after_summary"])
+
+    def test_detect_amount_changes(self):
+        """测试检测金额变更"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+        amount_changes = [c for c in changes if c["change_type"] == CHANGE_TYPE_AMOUNT_CHANGE]
+
+        self.assertTrue(any(c["record_no"] == "INV004" for c in amount_changes))
+
+        inv004 = next(c for c in amount_changes if c["record_no"] == "INV004")
+        self.assertEqual(inv004["old_value"], "1500.00")
+        self.assertEqual(inv004["new_value"], "1600.00")
+
+    def test_detect_key_field_changes(self):
+        """测试检测关键字段变更（客户名称等）"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+        key_changes = [c for c in changes if c["change_type"] == CHANGE_TYPE_KEY_FIELD_CHANGE]
+
+        self.assertTrue(any(c["record_no"] == "INV003" for c in key_changes))
+
+        inv003 = next(c for c in key_changes if c["record_no"] == "INV003")
+        self.assertEqual(inv003["field_name"], "customer")
+        self.assertEqual(inv003["old_value"], "广州电子厂")
+        self.assertEqual(inv003["new_value"], "广州电子有限公司")
+
+    def test_all_change_types_detected(self):
+        """测试所有变更类型都能被检测到"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        self.importer.import_payments(self.payment_v1, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        matches = self.db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        for m in matches:
+            self.db.confirm_match(m["id"], "operator_a", "确认匹配")
+
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+        change_types = {c["change_type"] for c in changes}
+
+        self.assertIn(CHANGE_TYPE_NEW_RECORD, change_types)
+        self.assertIn(CHANGE_TYPE_STATUS_CHANGE, change_types)
+        self.assertIn(CHANGE_TYPE_AMOUNT_CHANGE, change_types)
+        self.assertIn(CHANGE_TYPE_KEY_FIELD_CHANGE, change_types)
+
+
+class TestImpactAnalysis(unittest.TestCase):
+    """测试影响分析功能"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.tracker = ChangeTracker(self.config, self.db)
+        self.revoker = Revoker(self.db, self.config, self.workflow)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_impact_on_confirmed_matches(self):
+        """测试已确认匹配的影响分析"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        self.importer.import_payments(self.payment_v1, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        matches = self.db.get_matches_by_status()
+        confirmed_ids = []
+        for m in matches:
+            if m["status"] == MATCH_STATUS_PENDING:
+                self.matcher.confirm_match(m["id"], "operator_a", "确认匹配")
+                confirmed_ids.append(m["id"])
+            elif m["status"] == MATCH_STATUS_MATCHED:
+                confirmed_ids.append(m["id"])
+
+        self.assertGreater(len(confirmed_ids), 0, "应有已确认的匹配")
+
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+        amount_changes = [c for c in changes
+                         if c["change_type"] == CHANGE_TYPE_AMOUNT_CHANGE]
+
+        if amount_changes:
+            for c in amount_changes:
+                self.assertIsNotNone(c["impact_type"])
+                self.assertIsNotNone(c["impact_details"])
+                if c["record_no"] == "INV004":
+                    self.assertIn(c["impact_type"],
+                                  [IMPACT_TYPE_CONFIRMED, IMPACT_TYPE_CRITICAL])
+                    self.assertIsNotNone(c["impacted_match_ids"])
+                    self.assertGreater(len(c["impacted_match_ids"]), 0)
+
+    def test_impact_on_pending_matches(self):
+        """测试待确认匹配的影响分析"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        self.importer.import_payments(self.payment_v1, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        matches = self.db.get_matches_by_status()
+        pending_count = 0
+        for m in matches:
+            if m["status"] == MATCH_STATUS_PENDING:
+                pending_count += 1
+            elif m["status"] == MATCH_STATUS_MATCHED:
+                self.db.confirm_match(m["id"], "operator_a", "确认匹配")
+
+        pending_matches = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
+        if pending_count == 0 and len(pending_matches) == 0:
+            all_matches = self.db.get_matches_by_status()
+            self.assertGreater(len(all_matches), 0, "至少应有一些匹配")
+        else:
+            self.assertGreater(pending_count + len(pending_matches), 0, "应有匹配存在")
+
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        changes = self.db.get_batch_change_logs(batch_id=result["batch_id"])
+
+        for c in changes:
+            self.assertIsNotNone(c["impact_type"])
+            self.assertIsNotNone(c["impact_details"])
+
+        impact_summary = result.get("impact_summary", {})
+        self.assertIn(IMPACT_TYPE_PENDING, impact_summary)
+        self.assertIn(IMPACT_TYPE_CONFIRMED, impact_summary)
+
+    def test_impact_on_revoked_matches(self):
+        """测试已撤销匹配的影响分析"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        self.importer.import_payments(self.payment_v1, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        matches = self.db.get_matches_by_status()
+        revoked_count = 0
+        for m in matches:
+            if m["status"] == MATCH_STATUS_MATCHED:
+                self.revoker.revoke_match(m["id"], "operator_a", "撤销测试")
+                revoked_count += 1
+            elif m["status"] == MATCH_STATUS_PENDING:
+                self.matcher.confirm_match(m["id"], "operator_a", "确认后撤销")
+                self.revoker.revoke_match(m["id"], "operator_a", "撤销测试")
+                revoked_count += 1
+
+        self.assertGreater(revoked_count, 0, "应有已撤销的匹配")
+
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+        impact_summary = result.get("impact_summary", {})
+
+        self.assertIn(IMPACT_TYPE_REVOKED, impact_summary)
+
+    def test_impact_summary_in_import_result(self):
+        """测试导入结果包含影响统计"""
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        self.importer.import_payments(self.payment_v1, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+
+        self.assertIn("impact_summary", result)
+        impact_summary = result["impact_summary"]
+
+        for it in [IMPACT_TYPE_CRITICAL, IMPACT_TYPE_CONFIRMED,
+                   IMPACT_TYPE_PENDING, IMPACT_TYPE_REVOKED,
+                   IMPACT_TYPE_WARNING, IMPACT_TYPE_NONE]:
+            self.assertIn(it, impact_summary)
+
+
+class TestChangeLogExport(unittest.TestCase):
+    """测试变更日志导出功能"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.tracker = ChangeTracker(self.config, self.db)
+        self.workbench = BatchWorkbench(self.config, self.db)
+
+        self.importer.import_invoices(self.invoice_v1, "operator_a")
+        self.importer.import_payments(self.payment_v1, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        result = self.importer.import_invoices(self.invoice_v2, "operator_b")
+        self.batch_id = result["batch_id"]
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_export_json_format(self):
+        """测试JSON格式导出"""
+        result = self.tracker.export_change_logs(
+            self.batch_id, "export_user", format="json"
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.exists(result["file_path"]))
+        self.assertEqual(result["format"], "json")
+
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIn("export_info", data)
+        self.assertIn("summary", data)
+        self.assertIn("change_logs", data)
+
+        export_info = data["export_info"]
+        self.assertEqual(export_info["batch_id"], self.batch_id)
+        self.assertEqual(export_info["exported_by"], "export_user")
+        self.assertIn("exported_at", export_info)
+        self.assertIn("imported_at", export_info)
+        self.assertIn("imported_by", export_info)
+
+        summary = data["summary"]
+        self.assertIn("by_type", summary)
+        self.assertIn("by_impact", summary)
+        self.assertIn("by_status", summary)
+
+        change_logs = data["change_logs"]
+        self.assertGreater(len(change_logs), 0)
+
+        required_fields = [
+            "日志ID", "批次ID", "来源文件", "变更类型", "记录类型", "记录编号",
+            "变更字段", "原值", "新值", "变更摘要", "变更前摘要", "变更后摘要",
+            "影响类型", "影响详情", "影响的匹配ID", "处理状态",
+            "操作者", "检测时间", "处理时间", "处理人", "备注",
+        ]
+        for log in change_logs:
+            for field in required_fields:
+                self.assertIn(field, log, f"缺少字段: {field}")
+
+    def test_export_csv_format(self):
+        """测试CSV格式导出"""
+        result = self.tracker.export_change_logs(
+            self.batch_id, "export_user", format="csv"
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(os.path.isdir(result["file_path"]))
+        self.assertEqual(result["format"], "csv")
+        self.assertEqual(len(result["files"]), 2)
+
+        summary_path = result["files"][0]
+        logs_path = result["files"][1]
+
+        self.assertTrue(os.path.exists(summary_path))
+        self.assertTrue(os.path.exists(logs_path))
+
+        with open(summary_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            self.assertGreater(len(rows), 0)
+
+        with open(logs_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            self.assertIsNotNone(fieldnames)
+
+            required_fields = [
+                "日志ID", "批次ID", "来源文件", "变更类型", "记录类型", "记录编号",
+                "变更字段", "原值", "新值", "变更摘要",
+            ]
+            for field in required_fields:
+                self.assertIn(field, fieldnames, f"CSV缺少字段: {field}")
+
+            rows = list(reader)
+            self.assertGreater(len(rows), 0)
+
+    def test_export_contains_before_after_summaries(self):
+        """测试导出包含变更前后摘要"""
+        result = self.tracker.export_change_logs(
+            self.batch_id, "export_user", format="json"
+        )
+
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for log in data["change_logs"]:
+            self.assertIn("变更前摘要", log)
+            self.assertIn("变更后摘要", log)
+            self.assertNotEqual(log["变更后摘要"], "-")
+            if log["变更类型"] != "新增记录":
+                self.assertNotEqual(log["变更前摘要"], "-")
+
+    def test_export_contains_impact_info(self):
+        """测试导出包含影响分析信息"""
+        result = self.tracker.export_change_logs(
+            self.batch_id, "export_user", format="json"
+        )
+
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        for log in data["change_logs"]:
+            self.assertIn("影响类型", log)
+            self.assertIn("影响详情", log)
+            self.assertIn("影响的匹配ID", log)
+            self.assertIsNotNone(log["影响类型"])
+            self.assertIsNotNone(log["影响详情"])
+
+    def test_export_contains_operator_and_timestamps(self):
+        """测试导出包含操作者和时间戳"""
+        result = self.tracker.export_change_logs(
+            self.batch_id, "export_user", format="json"
+        )
+
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        export_info = data["export_info"]
+        self.assertIn("exported_at", export_info)
+        self.assertIn("exported_by", export_info)
+
+        for log in data["change_logs"]:
+            self.assertIn("检测时间", log)
+            self.assertIn("操作者", log)
+            self.assertIsNotNone(log["检测时间"])
+
+    def test_export_batch_info_preserved(self):
+        """测试导出保留批次信息"""
+        result = self.tracker.export_change_logs(
+            self.batch_id, "export_user", format="json"
+        )
+
+        with open(result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        export_info = data["export_info"]
+        self.assertEqual(export_info["batch_id"], self.batch_id)
+        self.assertIn("file_name", export_info)
+        self.assertIn("file_type", export_info)
+        self.assertIn("imported_at", export_info)
+
+        for log in data["change_logs"]:
+            self.assertEqual(log["批次ID"], self.batch_id)
+            self.assertIn("来源文件", log)
+
+
+class TestRestartRecovery(unittest.TestCase):
+    """测试重启恢复功能"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+
+        self.db = Database(self.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+        self.tracker = ChangeTracker(self.config, self.db)
+        self.workbench = BatchWorkbench(self.config, self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_export_context_persists_across_instances(self):
+        """测试导出上下文跨实例持久化"""
+        inv1 = self.importer.import_invoices(self.invoice_v1, "op_a")
+        batch_id = inv1["batch_id"]
+
+        self.workbench.save_export_context(
+            batch_id=batch_id,
+            export_type="change_logs",
+            format="json",
+            operator="export_user",
+        )
+
+        del self.db
+        del self.workbench
+
+        new_db = Database(self.db_path)
+        new_workbench = BatchWorkbench(self.config, new_db)
+
+        context = new_workbench.get_last_export_context()
+        self.assertIsNotNone(context)
+        self.assertEqual(context["batch_id"], batch_id)
+        self.assertEqual(context["export_type"], "change_logs")
+        self.assertEqual(context["format"], "json")
+        self.assertEqual(context["operator"], "export_user")
+        self.assertIn("file_name", context)
+        self.assertIn("file_type", context)
+
+    def test_change_view_context_persists(self):
+        """测试变更查看上下文持久化"""
+        inv1 = self.importer.import_invoices(self.invoice_v1, "op_a")
+        batch_id = inv1["batch_id"]
+
+        self.workbench.save_change_view_context(
+            batch_id=batch_id,
+            change_type=CHANGE_TYPE_AMOUNT_CHANGE,
+            impact_type=IMPACT_TYPE_CRITICAL,
+            processing_status=PROCESSING_STATUS_PENDING,
+            operator="viewer",
+        )
+
+        del self.db
+        del self.workbench
+
+        new_db = Database(self.db_path)
+        new_workbench = BatchWorkbench(self.config, new_db)
+
+        context = new_workbench.get_last_change_view_context()
+        self.assertIsNotNone(context)
+        self.assertEqual(context["batch_id"], batch_id)
+        self.assertEqual(context["change_type"], CHANGE_TYPE_AMOUNT_CHANGE)
+        self.assertEqual(context["impact_type"], IMPACT_TYPE_CRITICAL)
+        self.assertEqual(context["processing_status"], PROCESSING_STATUS_PENDING)
+
+    def test_last_selected_batch_recovery(self):
+        """测试上次选中批次恢复"""
+        inv1 = self.importer.import_invoices(self.invoice_v1, "op_a")
+        batch_id = inv1["batch_id"]
+
+        self.workbench.save_last_selected_batch(batch_id, "user_a")
+        self.workbench.save_filters(operator="op_a", status=MATCH_STATUS_PENDING)
+
+        del self.db
+        del self.workbench
+
+        new_db = Database(self.db_path)
+        new_workbench = BatchWorkbench(self.config, new_db)
+
+        restore_result = new_workbench.restore_workbench_state()
+        self.assertTrue(restore_result["restored"])
+        self.assertIsNotNone(restore_result["last_batch"])
+        self.assertEqual(restore_result["last_batch"]["batch_id"], batch_id)
+        self.assertEqual(restore_result["filters"]["operator"], "op_a")
+        self.assertEqual(restore_result["filters"]["status"], MATCH_STATUS_PENDING)
+
+    def test_change_logs_persist_across_restarts(self):
+        """测试变更日志跨重启持久化"""
+        self.importer.import_invoices(self.invoice_v1, "op_a")
+        result = self.importer.import_invoices(self.invoice_v2, "op_b")
+        batch_id = result["batch_id"]
+
+        original_logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        original_count = len(original_logs)
+        self.assertGreater(original_count, 0)
+
+        del self.db
+        del self.tracker
+
+        new_db = Database(self.db_path)
+        new_tracker = ChangeTracker(self.config, new_db)
+
+        restored_logs = new_db.get_batch_change_logs(batch_id=batch_id)
+        self.assertEqual(len(restored_logs), original_count)
+
+        for orig, restored in zip(original_logs, restored_logs):
+            self.assertEqual(orig["change_type"], restored["change_type"])
+            self.assertEqual(orig["record_no"], restored["record_no"])
+            self.assertEqual(orig["impact_type"], restored["impact_type"])
+
+    def test_processing_status_persists(self):
+        """测试处理状态持久化"""
+        self.importer.import_invoices(self.invoice_v1, "op_a")
+        result = self.importer.import_invoices(self.invoice_v2, "op_b")
+        batch_id = result["batch_id"]
+
+        logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        log_id = logs[0]["id"]
+
+        self.db.update_change_log_status(
+            log_id, PROCESSING_STATUS_REVIEWED, "reviewer", "已查看"
+        )
+
+        del self.db
+
+        new_db = Database(self.db_path)
+        updated = new_db.get_batch_change_logs(batch_id=batch_id)
+        updated_log = next(l for l in updated if l["id"] == log_id)
+
+        self.assertEqual(updated_log["processing_status"], PROCESSING_STATUS_REVIEWED)
+        self.assertEqual(updated_log["processed_by"], "reviewer")
+        self.assertIsNotNone(updated_log["processed_at"])
+
+
+class TestChangeTrackingFullWorkflow(unittest.TestCase):
+    """完整工作流回归测试：导入->变更检测->查看->导出->重启恢复"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+        self.payment_v2 = os.path.join(self.test_dir, "payments_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+        with open(self.payment_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V2)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_full_workflow(self):
+        """测试完整工作流"""
+        db = Database(self.db_path)
+        workflow = WorkflowManager(self.config, db)
+        importer = CSVImporter(self.config, db)
+        matcher = MatchEngine(self.config, db, workflow)
+        tracker = ChangeTracker(self.config, db)
+        workbench = BatchWorkbench(self.config, db)
+
+        inv1 = importer.import_invoices(self.invoice_v1, "operator_a")
+        pay1 = importer.import_payments(self.payment_v1, "operator_a")
+        matcher.run_auto_matching("operator_a")
+
+        matches = db.get_matches_by_status()
+        for m in matches:
+            if m["status"] == MATCH_STATUS_PENDING:
+                matcher.confirm_match(m["id"], "operator_a", "确认匹配")
+
+        inv_batch1 = inv1["batch_id"]
+        inv2 = importer.import_invoices(self.invoice_v2, "operator_b")
+        inv_batch2 = inv2["batch_id"]
+
+        self.assertIn("change_count", inv2)
+        self.assertGreater(inv2["change_count"], 0)
+        self.assertIn("changes_by_type", inv2)
+        self.assertIn("impact_summary", inv2)
+
+        workbench.save_last_selected_batch(inv_batch2, "operator_b")
+        workbench.save_filters(operator="operator_a", status=MATCH_STATUS_MATCHED)
+
+        changes = db.get_batch_change_logs(batch_id=inv_batch2)
+        self.assertGreater(len(changes), 0)
+
+        for c in changes:
+            self.assertIsNotNone(c["change_summary"])
+            self.assertIsNotNone(c["impact_type"])
+            self.assertIsNotNone(c["impact_details"])
+
+        change_summary = tracker.get_change_summary(batch_id=inv_batch2)
+        self.assertTrue(change_summary["success"])
+        self.assertGreater(change_summary["total_changes"], 0)
+        self.assertIn("by_type", change_summary)
+        self.assertIn("by_impact", change_summary)
+
+        json_export = tracker.export_change_logs(
+            inv_batch2, "exporter", format="json"
+        )
+        self.assertTrue(json_export["success"])
+
+        csv_export = tracker.export_change_logs(
+            inv_batch2, "exporter", format="csv"
+        )
+        self.assertTrue(csv_export["success"])
+
+        workbench.save_export_context(
+            batch_id=inv_batch2,
+            export_type="change_logs",
+            format="json",
+            operator="exporter",
+        )
+
+        workbench.save_change_view_context(
+            batch_id=inv_batch2,
+            change_type=CHANGE_TYPE_AMOUNT_CHANGE,
+            impact_type=IMPACT_TYPE_CRITICAL,
+            operator="viewer",
+        )
+
+        del db
+        del workflow
+        del importer
+        del matcher
+        del tracker
+        del workbench
+
+        db2 = Database(self.db_path)
+        workflow2 = WorkflowManager(self.config, db2)
+        tracker2 = ChangeTracker(self.config, db2)
+        workbench2 = BatchWorkbench(self.config, db2)
+
+        restore_result = workbench2.restore_workbench_state()
+        self.assertTrue(restore_result["restored"])
+        self.assertEqual(restore_result["last_batch"]["batch_id"], inv_batch2)
+        self.assertEqual(restore_result["filters"]["operator"], "operator_a")
+        self.assertEqual(restore_result["filters"]["status"], MATCH_STATUS_MATCHED)
+
+        export_context = workbench2.get_last_export_context()
+        self.assertIsNotNone(export_context)
+        self.assertEqual(export_context["batch_id"], inv_batch2)
+        self.assertEqual(export_context["export_type"], "change_logs")
+        self.assertEqual(export_context["format"], "json")
+
+        view_context = workbench2.get_last_change_view_context()
+        self.assertIsNotNone(view_context)
+        self.assertEqual(view_context["batch_id"], inv_batch2)
+        self.assertEqual(view_context["change_type"], CHANGE_TYPE_AMOUNT_CHANGE)
+
+        changes_after = db2.get_batch_change_logs(batch_id=inv_batch2)
+        self.assertEqual(len(changes_after), len(changes))
+
+        json_export2 = tracker2.export_change_logs(
+            inv_batch2, "exporter2", format="json"
+        )
+        self.assertTrue(json_export2["success"])
+        self.assertTrue(os.path.exists(json_export2["file_path"]))
+
+        with open(json_export2["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertEqual(data["export_info"]["batch_id"], inv_batch2)
+        self.assertEqual(data["export_info"]["exported_by"], "exporter2")
+        self.assertGreater(len(data["change_logs"]), 0)
+
+        for log in data["change_logs"]:
+            self.assertIsNotNone(log["变更前摘要"] if log["变更类型"] != "新增记录" else True)
+            self.assertIsNotNone(log["变更后摘要"])
+            self.assertIsNotNone(log["影响类型"])
+            self.assertIsNotNone(log["影响详情"])
+            self.assertIn(log["影响类型"], IMPACT_TYPE_LABELS.values())
+            self.assertIn(log["变更类型"], CHANGE_TYPE_LABELS.values())
+            self.assertIn(log["处理状态"], PROCESSING_STATUS_LABELS.values())
+
+        importer2 = CSVImporter(self.config, db2)
+        pay2 = importer2.import_payments(self.payment_v2, "operator_c")
+        self.assertIn("change_count", pay2)
+        self.assertGreater(pay2["change_count"], 0)
+
+        pay_changes = db2.get_batch_change_logs(batch_id=pay2["batch_id"])
+        self.assertGreater(len(pay_changes), 0)
+
+        pay_export = tracker2.export_change_logs(
+            pay2["batch_id"], "exporter", format="json"
+        )
+        self.assertTrue(pay_export["success"])
+
+
+if __name__ == "__main__":
+    unittest.main()

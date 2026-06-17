@@ -1,0 +1,4 @@
+﻿invoice_no,invoice_date,customer,amount,status
+INV-A,2024-06-01,Alpha Co,100.00,正常
+INV-B,2024-06-02,Beta LLC,200.00,正常
+INV-C,2024-06-03,Gamma Inc,300.00,正常

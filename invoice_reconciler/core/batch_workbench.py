@@ -27,6 +27,8 @@ SESSION_KEY_LAST_BATCH = "last_selected_batch"
 SESSION_KEY_FILTER_OPERATOR = "filter_operator"
 SESSION_KEY_FILTER_STATUS = "filter_status"
 SESSION_KEY_LAST_ACCESS_TIME = "last_access_time"
+SESSION_KEY_LAST_EXPORT = "last_export_context"
+SESSION_KEY_LAST_CHANGE_VIEW = "last_change_view_context"
 
 
 class BatchWorkbench:
@@ -369,3 +371,63 @@ class BatchWorkbench:
         self.db.clear_session_state(SESSION_KEY_LAST_BATCH)
         self.db.clear_session_state(SESSION_KEY_FILTER_OPERATOR)
         self.db.clear_session_state(SESSION_KEY_LAST_ACCESS_TIME)
+        self.db.clear_session_state(SESSION_KEY_LAST_EXPORT)
+        self.db.clear_session_state(SESSION_KEY_LAST_CHANGE_VIEW)
+
+    def save_export_context(self, batch_id: int, export_type: str,
+                            format: str, operator: str = None,
+                            filters: Dict = None) -> None:
+        context = {
+            "batch_id": batch_id,
+            "export_type": export_type,
+            "format": format,
+            "operator": operator,
+            "filters": filters or {},
+            "exported_at": datetime.now().isoformat(),
+        }
+        self.db.set_session_state(SESSION_KEY_LAST_EXPORT, context)
+        self.db.set_session_state(SESSION_KEY_LAST_ACCESS_TIME, datetime.now().isoformat())
+
+    def get_last_export_context(self) -> Optional[Dict]:
+        context = self.db.get_session_state(SESSION_KEY_LAST_EXPORT, None)
+        if not context:
+            return None
+
+        batch_id = context.get("batch_id")
+        if batch_id:
+            batch_info = self.db.get_batch(batch_id)
+            if batch_info:
+                context["file_name"] = batch_info["file_name"]
+                context["file_type"] = "发票" if batch_info["file_type"] == "invoice" else "收款"
+
+        return context
+
+    def save_change_view_context(self, batch_id: int = None,
+                                  change_type: str = None,
+                                  impact_type: str = None,
+                                  processing_status: str = None,
+                                  operator: str = None) -> None:
+        context = {
+            "batch_id": batch_id,
+            "change_type": change_type,
+            "impact_type": impact_type,
+            "processing_status": processing_status,
+            "operator": operator,
+            "viewed_at": datetime.now().isoformat(),
+        }
+        self.db.set_session_state(SESSION_KEY_LAST_CHANGE_VIEW, context)
+        self.db.set_session_state(SESSION_KEY_LAST_ACCESS_TIME, datetime.now().isoformat())
+
+    def get_last_change_view_context(self) -> Optional[Dict]:
+        context = self.db.get_session_state(SESSION_KEY_LAST_CHANGE_VIEW, None)
+        if not context:
+            return None
+
+        batch_id = context.get("batch_id")
+        if batch_id:
+            batch_info = self.db.get_batch(batch_id)
+            if batch_info:
+                context["file_name"] = batch_info["file_name"]
+                context["file_type"] = "发票" if batch_info["file_type"] == "invoice" else "收款"
+
+        return context

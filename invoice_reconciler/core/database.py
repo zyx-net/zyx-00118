@@ -306,6 +306,36 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_session_state_key ON session_state(key);
+
+                CREATE TABLE IF NOT EXISTS batch_change_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL,
+                    change_type TEXT NOT NULL,
+                    record_type TEXT NOT NULL,
+                    record_no TEXT NOT NULL,
+                    field_name TEXT,
+                    old_value TEXT,
+                    new_value TEXT,
+                    change_summary TEXT NOT NULL,
+                    before_summary TEXT,
+                    after_summary TEXT,
+                    impact_type TEXT,
+                    impact_details TEXT,
+                    impacted_match_ids TEXT,
+                    operator TEXT,
+                    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    processing_status TEXT DEFAULT 'pending',
+                    processed_at DATETIME,
+                    processed_by TEXT,
+                    remark TEXT,
+                    FOREIGN KEY (batch_id) REFERENCES import_batches(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_change_logs_batch ON batch_change_logs(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_change_logs_type ON batch_change_logs(change_type);
+                CREATE INDEX IF NOT EXISTS idx_change_logs_record ON batch_change_logs(record_no);
+                CREATE INDEX IF NOT EXISTS idx_change_logs_impact ON batch_change_logs(impact_type);
+                CREATE INDEX IF NOT EXISTS idx_change_logs_status ON batch_change_logs(processing_status);
             """)
 
     @staticmethod
@@ -1582,6 +1612,84 @@ class Database:
                 conn.execute("DELETE FROM session_state WHERE key = ?", (key,))
             else:
                 conn.execute("DELETE FROM session_state")
+
+    def insert_batch_change_log(self, batch_id: int, change_type: str, record_type: str,
+                                record_no: str, change_summary: str,
+                                field_name: str = None, old_value: str = None,
+                                new_value: str = None, before_summary: str = None,
+                                after_summary: str = None, impact_type: str = None,
+                                impact_details: str = None, impacted_match_ids: List[int] = None,
+                                operator: str = None, processing_status: str = 'pending',
+                                remark: str = None) -> int:
+        import json
+        impacted_ids_str = json.dumps(impacted_match_ids) if impacted_match_ids else None
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO batch_change_logs
+                   (batch_id, change_type, record_type, record_no, field_name,
+                    old_value, new_value, change_summary, before_summary, after_summary,
+                    impact_type, impact_details, impacted_match_ids, operator,
+                    processing_status, remark)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, change_type, record_type, record_no, field_name,
+                 old_value, new_value, change_summary, before_summary, after_summary,
+                 impact_type, impact_details, impacted_ids_str, operator,
+                 processing_status, remark)
+            )
+            return cursor.lastrowid
+
+    def get_batch_change_logs(self, batch_id: int = None, change_type: str = None,
+                              impact_type: str = None, processing_status: str = None,
+                              record_no: str = None) -> List[Dict]:
+        import json
+        with self._get_conn() as conn:
+            sql = """SELECT cl.*, b.file_name, b.file_type, b.imported_at as batch_imported_at
+                     FROM batch_change_logs cl
+                     JOIN import_batches b ON cl.batch_id = b.id
+                     WHERE 1=1"""
+            params = []
+            if batch_id:
+                sql += " AND cl.batch_id = ?"
+                params.append(batch_id)
+            if change_type:
+                sql += " AND cl.change_type = ?"
+                params.append(change_type)
+            if impact_type:
+                sql += " AND cl.impact_type = ?"
+                params.append(impact_type)
+            if processing_status:
+                sql += " AND cl.processing_status = ?"
+                params.append(processing_status)
+            if record_no:
+                sql += " AND cl.record_no = ?"
+                params.append(record_no)
+            sql += " ORDER BY cl.detected_at DESC"
+
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict.get("impacted_match_ids"):
+                    try:
+                        row_dict["impacted_match_ids"] = json.loads(row_dict["impacted_match_ids"])
+                    except (json.JSONDecodeError, TypeError):
+                        row_dict["impacted_match_ids"] = []
+                result.append(row_dict)
+            return result
+
+    def update_change_log_status(self, log_id: int, processing_status: str,
+                                 processed_by: str = None, remark: str = None) -> None:
+        from datetime import datetime
+        with self._get_conn() as conn:
+            sql = """UPDATE batch_change_logs
+                        SET processing_status = ?, processed_at = ?, processed_by = ?"""
+            params = [processing_status, datetime.now().isoformat(), processed_by]
+            if remark:
+                sql += ", remark = COALESCE(remark, '') || ?"
+                params.append(f" {remark}")
+            sql += " WHERE id = ?"
+            params.append(log_id)
+            conn.execute(sql, tuple(params))
 
     def get_batch_summary(self, batch_id: int = None) -> List[Dict]:
         with self._get_conn() as conn:
