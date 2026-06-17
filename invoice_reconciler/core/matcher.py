@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 from .config import Config
 from .database import (
-    Database, MATCH_STATUS_MATCHED, MATCH_STATUS_PENDING, MATCH_STATUS_EXCEPTION
+    Database, MATCH_STATUS_MATCHED, MATCH_STATUS_PENDING, MATCH_STATUS_EXCEPTION,
+    MATCH_STATUS_REVOKED
 )
 from .workflow import WorkflowManager
 
@@ -226,6 +227,20 @@ class MatchEngine:
 
     def manual_match(self, invoice_id: int, payment_id: int, operator: str,
                      remark: str = None) -> Dict:
+        if self.workflow and self.config.enable_lock:
+            related_matches = [
+                m for m in self.db.get_matches_by_status()
+                if m["status"] != MATCH_STATUS_REVOKED
+                and (m["invoice_id"] == invoice_id or m["payment_id"] == payment_id)
+            ]
+            for m in related_matches:
+                can_operate, msg = self.workflow.can_operate_match(operator, m["id"])
+                if not can_operate:
+                    raise ValueError(
+                        f"与该发票/收款关联的匹配记录({m['match_no']})未获得锁权限: {msg}。"
+                        f"请先执行 'lock acquire {m['id']}' 或联系管理员强制解锁后再操作"
+                    )
+
         invoice = self.db.get_invoice_by_id(invoice_id)
         if not invoice:
             raise ValueError(f"发票记录不存在: {invoice_id}")

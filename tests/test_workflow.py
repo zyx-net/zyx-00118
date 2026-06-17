@@ -1078,5 +1078,249 @@ class TestStartupRestoresLockConfig(unittest.TestCase):
         self.assertEqual(restore["expired_locks"], 1)
 
 
+class TestManualMatchLockEnforcement(unittest.TestCase):
+    """人工改配(confirm manual)的锁强制校验 —— 确保不能绕过他人的锁直接创建新匹配"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="wf_manual_lock_")
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=True,
+        )
+        self.invoice_csv = os.path.join(self.test_dir, "inv.csv")
+        self.payment_csv = os.path.join(self.test_dir, "pay.csv")
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _bootstrap(self):
+        """用 CSV 导入 + 自动匹配打底数据"""
+        db = Database(self.db_path)
+        wf = WorkflowManager(self.config, db)
+        imp = CSVImporter(self.config, db)
+        mch = MatchEngine(self.config, db, wf)
+        rvk = Revoker(db, self.config, wf)
+        imp.import_invoices(self.invoice_csv, "op_imp")
+        imp.import_payments(self.payment_csv, "op_imp")
+        mch.run_auto_matching("op_match")
+        return db, wf, mch, rvk
+
+    def _find_target(self, db, wf, mch, exclude_id=None):
+        """找一条非撤销的匹配记录，并确保其 invoice/payment 是未匹配状态（用于 manual_match 测试）"""
+        matches = [m for m in db.get_matches_by_status()
+                   if m["status"] != MATCH_STATUS_REVOKED
+                   and (exclude_id is None or m["id"] != exclude_id)]
+        self.assertGreater(len(matches), 0, "需要至少一条非撤销匹配")
+        target = matches[0]
+
+        # 如果 target 状态是 MATCHED，手动临时改成 PENDING（这样 invoice/payment 变成未匹配，
+        # 但锁仍然在原 match_id 上，manual_match 的关联记录检查仍然有效）
+        if target["status"] == MATCH_STATUS_MATCHED:
+            with db._get_conn() as conn:
+                conn.execute(
+                    "UPDATE matches SET status = ? WHERE id = ?",
+                    (MATCH_STATUS_PENDING, target["id"])
+                )
+                # 同步把 invoice 和 payment 的 match_status 改成 unmatched
+                conn.execute(
+                    "UPDATE invoices SET match_status = ? WHERE id = ?",
+                    ("unmatched", target["invoice_id"])
+                )
+                conn.execute(
+                    "UPDATE payments SET match_status = ? WHERE id = ?",
+                    ("unmatched", target["payment_id"])
+                )
+            target = db.get_match_by_id(target["id"])
+
+        # 找一个未匹配的 invoice
+        inv_for_manual = None
+        for inv in db.get_unmatched_invoices():
+            inv_for_manual = {"id": inv["id"]}
+            break
+
+        # 找一个未匹配的 payment
+        pay_for_manual = None
+        for pay in db.get_unmatched_payments():
+            pay_for_manual = {"id": pay["id"]}
+            break
+
+        if inv_for_manual is None:
+            inv_for_manual = {"id": target["invoice_id"]}
+        if pay_for_manual is None:
+            pay_for_manual = {"id": target["payment_id"]}
+
+        return target, inv_for_manual, pay_for_manual
+
+    def test_manual_match_blocked_when_invoice_has_others_lock(self):
+        """未持锁人工改配失败：invoice 已有匹配被他人锁定"""
+        db, wf, mch, rvk = self._bootstrap()
+        target, inv_for_manual, pay_for_manual = self._find_target(db, wf, mch)
+
+        # alice 先锁定 target（该记录含 invoice_id=target.invoice_id）
+        wf.acquire_lock(target["id"], "alice", "alice 先抢到锁")
+
+        # 现在 manual_match 使用 target.invoice_id + 另一个未匹配 payment
+        manual_inv_id = target["invoice_id"]
+        manual_pay_id = pay_for_manual["id"]
+        if manual_pay_id == target["payment_id"]:
+            # 复用同一个 payment 也可以，manual_match 照样会检测到关联记录
+            pass
+
+        # bob 人工改配应该被拒绝（因为 target 被 alice 锁了）
+        with self.assertRaises(ValueError) as ctx:
+            mch.manual_match(manual_inv_id, manual_pay_id, "bob", "bob 绕过锁")
+        self.assertIn("未获得锁权限", str(ctx.exception))
+        self.assertIn("lock acquire", str(ctx.exception))
+
+        # 验证：没有产生额外的 matched 记录（只有 alice 的那条）
+        new_matches = [
+            m for m in db.get_matches_by_status(MATCH_STATUS_MATCHED)
+            if m["invoice_id"] == manual_inv_id and m.get("operator") == "bob"
+        ]
+        self.assertEqual(len(new_matches), 0, "绕过锁的人工改配不应该落库")
+
+    def test_manual_match_success_when_operator_has_lock(self):
+        """持锁后人工改配成功：操作者自己持锁时应该允许人工改配"""
+        db, wf, mch, rvk = self._bootstrap()
+        target, inv_for_manual, pay_for_manual = self._find_target(db, wf, mch)
+
+        # charlie 先持锁
+        wf.acquire_lock(target["id"], "charlie", "charlie 认领并处理")
+
+        # 用 target.invoice_id + 另一个 payment 人工改配
+        manual_inv_id = target["invoice_id"]
+        manual_pay_id = pay_for_manual["id"]
+
+        result = mch.manual_match(
+            manual_inv_id, manual_pay_id, "charlie", "charlie 持锁后人工改配"
+        )
+        self.assertTrue(result["success"])
+        self.assertIn("match_no", result)
+
+        # 验证：新 matched 记录落库，且 operator 是 charlie，类型是 manual
+        new_matches = [
+            m for m in db.get_matches_by_status(MATCH_STATUS_MATCHED)
+            if m["invoice_id"] == manual_inv_id and m.get("operator") == "charlie"
+        ]
+        self.assertGreaterEqual(len(new_matches), 1)
+        charlie_manual = [m for m in new_matches if m["match_type"] == "manual"]
+        self.assertGreaterEqual(len(charlie_manual), 1)
+
+        # 验证：锁历史中有 charlie 的 lock 记录
+        lock_hist = db.get_lock_history(match_id=target["id"])
+        self.assertGreaterEqual(len(lock_hist), 1)
+        self.assertIn("lock", [h["action"] for h in lock_hist])
+
+    def test_manual_match_blocked_when_payment_has_others_lock(self):
+        """他人持锁情况下人工改配被拒绝：payment 已有匹配被他人锁定"""
+        db, wf, mch, rvk = self._bootstrap()
+        target, inv_for_manual, pay_for_manual = self._find_target(db, wf, mch)
+
+        # alice 锁定了 target（它包含 payment_id）
+        wf.acquire_lock(target["id"], "alice", "alice 锁定含 pay_id 的匹配")
+
+        # dave 用另一个 invoice + target.payment_id 人工改配
+        manual_inv_id = inv_for_manual["id"]
+        manual_pay_id = target["payment_id"]
+        if manual_inv_id == target["invoice_id"]:
+            # 同一个 invoice 没关系，反正 payment 被锁了
+            pass
+
+        with self.assertRaises(ValueError) as ctx:
+            mch.manual_match(manual_inv_id, manual_pay_id, "dave", "dave 抢同 payment")
+        self.assertIn("未获得锁权限", str(ctx.exception))
+
+    def test_revoke_blocked_without_lock_first(self):
+        """撤销入口无锁被拒：普通复核员没拿到自己的锁就不能撤销"""
+        db, wf, mch, rvk = self._bootstrap()
+        matched = db.get_matches_by_status(MATCH_STATUS_MATCHED)
+        if not matched:
+            # 没有 matched，就先用 admin 造一条
+            any_match = [m for m in db.get_matches_by_status() if m["status"] != MATCH_STATUS_REVOKED]
+            self.assertGreater(len(any_match), 0)
+            t = any_match[0]
+            wf.acquire_lock(t["id"], "admin", "admin 先造数据")
+            try:
+                mch.confirm_match(t["id"], "admin", "造一个 matched")
+            except ValueError:
+                pass  # 已经是 matched 就没关系
+            matched = db.get_matches_by_status(MATCH_STATUS_MATCHED)
+
+        self.assertGreater(len(matched), 0)
+        target = matched[0]
+
+        # eve 无锁直接撤销 → 失败
+        r = rvk.revoke_match(target["id"], "eve", "无锁想撤销")
+        self.assertFalse(r["success"])
+        self.assertEqual(r["error_type"], "lock_violation")
+        self.assertIn("锁定", r["message"])
+
+        # 状态没变
+        m_after = db.get_match_by_id(target["id"])
+        self.assertEqual(m_after["status"], MATCH_STATUS_MATCHED)
+
+    def test_admin_can_manual_match_without_lock(self):
+        """管理员(admin)可绕过锁：人工改配不会被拒绝"""
+        db, wf, mch, rvk = self._bootstrap()
+        target, inv_for_manual, pay_for_manual = self._find_target(db, wf, mch)
+
+        # frank 普通用户先锁了 target
+        wf.acquire_lock(target["id"], "frank", "frank 普通用户持锁")
+
+        # admin 用同 invoice + 另一个 payment 人工改配 → 应成功
+        manual_inv_id = target["invoice_id"]
+        manual_pay_id = pay_for_manual["id"]
+
+        result = mch.manual_match(
+            manual_inv_id, manual_pay_id, "admin", "admin 强制人工改配"
+        )
+        self.assertTrue(result["success"])
+        self.assertIn("match_no", result)
+
+    def test_confirm_and_reject_still_work_after_fix(self):
+        """修复后不会误伤现有确认/拒绝链路（回归验证）"""
+        db, wf, mch, rvk = self._bootstrap()
+        all_non_revoked = [m for m in db.get_matches_by_status()
+                           if m["status"] != MATCH_STATUS_REVOKED]
+        self.assertGreaterEqual(len(all_non_revoked), 2)
+
+        t1 = all_non_revoked[0]
+        t2 = all_non_revoked[1]
+
+        # t1: 先锁 → confirm（如果是 pending 就会成功，否则跳过）
+        wf.acquire_lock(t1["id"], "grace", "grace 处理 t1")
+        if t1["status"] == MATCH_STATUS_PENDING:
+            r1 = mch.confirm_match(t1["id"], "grace", "正常确认")
+            self.assertEqual(r1["status"], MATCH_STATUS_MATCHED)
+
+        # t2: 先锁 → reject（如果是 pending 才成功）
+        wf.acquire_lock(t2["id"], "grace", "grace 处理 t2")
+        if t2["status"] == MATCH_STATUS_PENDING:
+            r2 = mch.reject_match(t2["id"], "grace", "正常拒绝")
+            self.assertTrue(r2["success"])
+
+        # 找任何一条记录，不锁定就 confirm/reject → 仍应被拒绝
+        other = [m for m in all_non_revoked if m["id"] not in {t1["id"], t2["id"]}]
+        if other and other[0]["status"] == MATCH_STATUS_PENDING:
+            with self.assertRaises(ValueError) as ctx:
+                mch.confirm_match(other[0]["id"], "henry", "无锁确认")
+            self.assertIn("锁定", str(ctx.exception))
+
+        # 验证锁历史：grace 有至少 2 次 lock 操作
+        full_hist = db.get_lock_history()
+        grace_locks = [h for h in full_hist if h["operator"] == "grace"
+                       and h["action"] == "lock"]
+        self.assertGreaterEqual(len(grace_locks), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

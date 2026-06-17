@@ -1,0 +1,4 @@
+﻿invoice_no,invoice_date,customer,amount,status,remark
+INV-A,2026-06-01,Alpha Co,100.00,normal,exact-match
+INV-B,2026-06-02,Beta Co,200.00,normal,multi-candidate
+INV-C,2026-06-03,Gamma Co,300.00,normal,exact-match

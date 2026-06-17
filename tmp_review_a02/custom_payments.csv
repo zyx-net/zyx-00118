@@ -1,0 +1,5 @@
+﻿payment_no,payment_date,customer,amount,remark
+PAY-A,2026-06-01,Alpha Co,100.00,INV-A exact
+PAY-B1,2026-06-02,Beta Co,200.00,INV-B candidate 1
+PAY-B2,2026-06-03,Beta Co,200.00,INV-B candidate 2
+PAY-C,2026-06-03,Gamma Co,300.00,INV-C exact

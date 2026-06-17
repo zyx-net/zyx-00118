@@ -20,6 +20,23 @@ class Revoker:
                 "message": f"匹配记录不存在: {match_id}"
             }
 
+        if not operator:
+            return {
+                "success": False,
+                "error_type": "empty_operator",
+                "message": "撤销操作必须指定操作者"
+            }
+
+        # 先锁后处理：锁检查放在状态检查之前，与 confirm_match 保持一致
+        if self.workflow and self.config and self.config.enable_lock:
+            can_operate, msg = self.workflow.can_operate_match(operator, match_id)
+            if not can_operate:
+                return {
+                    "success": False,
+                    "error_type": "lock_violation",
+                    "message": msg
+                }
+
         if match["status"] == MATCH_STATUS_REVOKED:
             return {
                 "success": False,
@@ -36,22 +53,6 @@ class Revoker:
                     f"匹配编号: {match['match_no']}"
                 )
             }
-
-        if not operator:
-            return {
-                "success": False,
-                "error_type": "empty_operator",
-                "message": "撤销操作必须指定操作者"
-            }
-
-        if self.workflow and self.config and self.config.enable_lock:
-            can_operate, msg = self.workflow.can_operate_match(operator, match_id)
-            if not can_operate:
-                return {
-                    "success": False,
-                    "error_type": "lock_violation",
-                    "message": msg
-                }
 
         try:
             self.db.revoke_match(match_id, operator, remark)
