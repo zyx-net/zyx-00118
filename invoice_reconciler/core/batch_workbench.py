@@ -158,6 +158,8 @@ class BatchWorkbench:
         batch = batch_summary["batches"][0]
         matches = self.get_batch_matches(batch_id)
         conflicts = self.db.get_batch_conflicts(batch_id=batch_id)
+        unmatched_inv = self.db.get_unmatched_invoices_by_batch(batch_id)
+        unmatched_pay = self.db.get_unmatched_payments_by_batch(batch_id)
 
         from .exporter import STATUS_LABELS, MATCH_TYPE_LABELS
 
@@ -187,6 +189,8 @@ class BatchWorkbench:
             },
             "conflicts": [],
             "matches": [],
+            "unmatched_invoices": [],
+            "unmatched_payments": [],
         }
 
         for conflict in conflicts:
@@ -245,6 +249,34 @@ class BatchWorkbench:
                 "status_history": history_str,
             })
 
+        for inv in unmatched_inv:
+            export_data["unmatched_invoices"].append({
+                "invoice_id": inv["id"],
+                "invoice_no": inv["invoice_no"],
+                "invoice_date": inv["invoice_date"],
+                "customer": inv["customer"],
+                "amount": inv["amount"],
+                "status": inv["status"],
+                "match_status": STATUS_LABELS.get(inv["match_status"], inv["match_status"]),
+                "file_row_num": inv["file_row_num"],
+                "file_name": inv.get("file_name", ""),
+                "batch_imported_at": inv.get("batch_imported_at", ""),
+            })
+
+        for pay in unmatched_pay:
+            export_data["unmatched_payments"].append({
+                "payment_id": pay["id"],
+                "payment_no": pay["payment_no"],
+                "payment_date": pay["payment_date"],
+                "customer": pay["customer"],
+                "amount": pay["amount"],
+                "status": pay["status"],
+                "match_status": STATUS_LABELS.get(pay["match_status"], pay["match_status"]),
+                "file_row_num": pay["file_row_num"],
+                "file_name": pay.get("file_name", ""),
+                "batch_imported_at": pay.get("batch_imported_at", ""),
+            })
+
         return {
             "success": True,
             "batch_id": batch_id,
@@ -255,6 +287,8 @@ class BatchWorkbench:
                 "confirmed_count": batch["confirmed_matches"],
                 "exception_count": batch["exception_matches"],
                 "revoked_count": batch["revoked_matches"],
+                "unmatched_invoices_count": len(unmatched_inv),
+                "unmatched_payments_count": len(unmatched_pay),
                 "conflict_count": len(conflicts),
             }
         }

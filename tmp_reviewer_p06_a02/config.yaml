@@ -1,0 +1,21 @@
+amount_tolerance: 0.01
+date_window_days: 30
+invoice_required_columns:
+  - invoice_no
+  - invoice_date
+  - customer
+  - amount
+  - status
+payment_required_columns:
+  - payment_no
+  - payment_date
+  - customer
+  - amount
+export_format: json
+db_path: tmp_reviewer_p06_a02/reviewer.db
+export_dir: tmp_reviewer_p06_a02/exports
+lock_timeout_seconds: 3600
+default_user_role: reviewer
+admin_users:
+  - admin
+enable_lock: true

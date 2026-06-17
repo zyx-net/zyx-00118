@@ -497,6 +497,8 @@ class ReportExporter:
         progress = data["progress"]
         raw_matches = data["matches"]
         raw_conflicts = data["conflicts"]
+        raw_unmatched_inv = data.get("unmatched_invoices", [])
+        raw_unmatched_pay = data.get("unmatched_payments", [])
 
         matches = []
         for m in raw_matches:
@@ -569,7 +571,37 @@ class ReportExporter:
             "批次摘要": batch_summary,
             "匹配明细": matches,
             "批次冲突": conflicts,
+            "未匹配发票": [],
+            "未匹配收款": [],
         }
+
+        for inv in raw_unmatched_inv:
+            export_data["未匹配发票"].append({
+                "发票ID": inv.get("invoice_id", ""),
+                "发票号": inv.get("invoice_no", ""),
+                "发票日期": inv.get("invoice_date", ""),
+                "客户": inv.get("customer", ""),
+                "发票金额": f"{inv.get('amount', 0):.2f}" if inv.get("amount") is not None else "-",
+                "发票状态": inv.get("status", ""),
+                "匹配状态": inv.get("match_status", ""),
+                "文件行号": inv.get("file_row_num", ""),
+                "来源文件": inv.get("file_name", ""),
+                "导入时间": inv.get("batch_imported_at", ""),
+            })
+
+        for pay in raw_unmatched_pay:
+            export_data["未匹配收款"].append({
+                "收款ID": pay.get("payment_id", ""),
+                "收款号": pay.get("payment_no", ""),
+                "收款日期": pay.get("payment_date", ""),
+                "客户": pay.get("customer", ""),
+                "收款金额": f"{pay.get('amount', 0):.2f}" if pay.get("amount") is not None else "-",
+                "收款状态": pay.get("status", ""),
+                "匹配状态": pay.get("match_status", ""),
+                "文件行号": pay.get("file_row_num", ""),
+                "来源文件": pay.get("file_name", ""),
+                "导入时间": pay.get("batch_imported_at", ""),
+            })
 
         if export_format == "xlsx":
             file_path = self._export_xlsx(base_name, export_data)
@@ -581,6 +613,8 @@ class ReportExporter:
                 "progress": progress,
                 "matches": matches,
                 "conflicts": conflicts,
+                "unmatched_invoices": export_data["未匹配发票"],
+                "unmatched_payments": export_data["未匹配收款"],
             })
         else:
             raise ValueError(f"不支持的导出格式: {export_format}")

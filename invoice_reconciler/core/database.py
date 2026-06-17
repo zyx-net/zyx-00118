@@ -413,6 +413,30 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_unmatched_invoices_by_batch(self, batch_id: int) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT i.*, b.file_name, b.imported_at as batch_imported_at
+                   FROM invoices i
+                   LEFT JOIN import_batches b ON i.batch_id = b.id
+                   WHERE i.batch_id = ? AND i.match_status = 'unmatched' AND i.status = 'normal'
+                   ORDER BY i.invoice_date""",
+                (batch_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_unmatched_payments_by_batch(self, batch_id: int) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT p.*, b.file_name, b.imported_at as batch_imported_at
+                   FROM payments p
+                   LEFT JOIN import_batches b ON p.batch_id = b.id
+                   WHERE p.batch_id = ? AND p.match_status = 'unmatched' AND p.status = 'normal'
+                   ORDER BY p.payment_date""",
+                (batch_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_unmatched_payments(self) -> List[Dict]:
         with self._get_conn() as conn:
             rows = conn.execute(

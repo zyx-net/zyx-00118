@@ -1,0 +1,69 @@
+{
+  "batch_info": {
+    "batch_id": 1,
+    "file_type": "发票",
+    "file_name": "reviewer_invoices_partial.csv",
+    "operator": "reviewerA",
+    "imported_at": "2026-06-17 22:32:18",
+    "total_rows": 3,
+    "success_rows": 3,
+    "failed_rows": 0
+  },
+  "progress": {
+    "total_matches": 2,
+    "pending_matches": 0,
+    "confirmed_matches": 1,
+    "exception_matches": 0,
+    "revoked_matches": 0,
+    "unmatched_invoices": 3,
+    "unmatched_payments": 0,
+    "conflict_count": 0,
+    "progress_percent": 25.0,
+    "exported_at": "2026-06-18T06:32:28.265682",
+    "exported_by": "reviewerA"
+  },
+  "matches": [
+    {
+      "匹配ID": 1,
+      "匹配编号": "M202606180001",
+      "匹配类型": "自动精确匹配",
+      "状态": "已匹配",
+      "发票号": "RINV001",
+      "发票金额": "1000.00",
+      "收款号": "RPAY001",
+      "收款金额": "1000.00",
+      "匹配方式": "客户完全匹配; 金额精确匹配 (差异: 0.00); 日期差异 1 天 (窗口内) (总分: 99.0)",
+      "处理人": "reviewerA",
+      "操作时间": "2026-06-18 06:32:28.244863"
+    },
+    {
+      "匹配ID": 2,
+      "匹配编号": "M202606180002",
+      "匹配类型": "自动精确匹配",
+      "状态": "已匹配",
+      "发票号": "RINV002",
+      "发票金额": "2500.50",
+      "收款号": "RPAY002",
+      "收款金额": "2500.50",
+      "匹配方式": "客户完全匹配; 金额精确匹配 (差异: 0.00); 日期差异 1 天 (窗口内) (总分: 99.0)",
+      "处理人": "reviewerA",
+      "操作时间": "2026-06-18 06:32:28.253780"
+    }
+  ],
+  "conflicts": [],
+  "unmatched_invoices": [
+    {
+      "发票ID": 3,
+      "发票号": "RINV003",
+      "发票日期": "2024-01-17",
+      "客户": "Gamma Co",
+      "发票金额": "3000.00",
+      "发票状态": "normal",
+      "匹配状态": "未匹配",
+      "文件行号": 4,
+      "来源文件": "reviewer_invoices_partial.csv",
+      "导入时间": "2026-06-17 22:32:18"
+    }
+  ],
+  "unmatched_payments": []
+}

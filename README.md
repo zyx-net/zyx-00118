@@ -325,8 +325,19 @@ python -m invoice_reconciler.cli.main batch clear-state
 - **批次摘要 Sheet**：批次信息、进度百分比、各状态计数（待确认/已确认/异常/已撤销）、冲突数
 - **匹配明细 Sheet**: 所有匹配记录（带处理人、状态、操作时间、匹配证据）
 - **批次冲突 Sheet**: 所有冲突记录（含冲突类型：新增记录、状态变更、金额变更、重复处理；差异原因写入）
-- **未匹配项 Sheet**: 未匹配发票和收款列表
-- **JSON 格式**：包含完整的结构化数据，含 batch_info、progress、matches、conflicts、unmatched_invoices、unmatched_payments
+- **未匹配发票 Sheet**: 本批次未匹配的发票明细（发票号、日期、客户、金额、匹配状态、来源文件）
+- **未匹配收款 Sheet**: 本批次未匹配的收款明细（收款号、日期、客户、金额、匹配状态、来源文件）
+- **JSON 格式**：包含 6 个顶级字段的结构化数据：
+  ```json
+  {
+    "batch_info": { "batch_id": 1, "file_type": "发票", "file_name": "...", ... },
+    "progress": { "pending_matches": 5, "confirmed_matches": 2, "unmatched_invoices": 9, ... },
+    "matches": [ { "匹配ID": 1, "发票号": "INV001", "收款号": "PAY001", ... } ],
+    "conflicts": [ { "冲突类型": "status_change", "冲突原因": "...", ... } ],
+    "unmatched_invoices": [ { "发票号": "INV003", "客户": "...", "发票金额": "8000.00", ... } ],
+    "unmatched_payments": [ { "收款号": "PAY005", "客户": "...", "收款金额": "5000.00", ... } ]
+  }
+  ```
 
 ## 配置说明
 
@@ -660,7 +671,7 @@ python -m invoice_reconciler.cli.main review snapshot create \
     --operator admin --description "最终复核完成"
 python -m invoice_reconciler.cli.main export full --operator admin --format json
 
-# 28. 跑测试套件验证（32个测试，覆盖批次统计、撤销后重导、冲突导出、重启恢复等回归场景）
+# 28. 跑测试套件验证（36个测试，覆盖批次统计、撤销后重导、冲突导出、重启恢复、未匹配项导出等回归场景）
 python -m unittest tests.test_batch_workbench -v
 ```
 
@@ -931,7 +942,7 @@ python -m invoice_reconciler.cli.main batch export-progress 1 --operator reviewe
 #    模拟重启：手动恢复会话状态，显示上次批次+筛选条件
 python -m invoice_reconciler.cli.main batch restore
 
-# ── 16. 运行测试套件（32个测试，覆盖导入更新、冲突导出、撤销后重导、重启恢复等回归场景） ──
+# ── 16. 运行测试套件（36个测试，覆盖导入更新、冲突导出、撤销后重导、重启恢复、未匹配项导出等回归场景） ──
 python -m unittest tests.test_batch_workbench -v
 ```
 
@@ -943,4 +954,4 @@ python -m unittest tests.test_batch_workbench -v
 > 5. 第13步 replay 输出包含"一致"或"差异"字样 ✅
 > 6. 第15.5步 batch summary 中的 progress_percent ∈ [0, 100]，各状态计数≥0 ✅
 > 7. 第15.5步 batch restore 正确返回 has_state=true，last_batch_id=上次选择的批次 ✅
-> 8. 第16步所有 32 个测试显示 `OK` ✅
+> 8. 第16步所有 36 个测试显示 `OK` ✅

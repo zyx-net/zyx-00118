@@ -1276,5 +1276,225 @@ class TestBatchWorkbenchRegressionRestartRecovery(unittest.TestCase):
         self.assertEqual(state["last_batch_id"], inv_batch_id)
 
 
+SAMPLE_INVOICES_PARTIAL_CSV = """invoice_no,invoice_date,customer,amount,status
+INV001,2024-01-15,北京科技有限公司,1000.00,正常
+INV002,2024-01-16,上海贸易公司,2500.50,正常
+INV003,2024-01-17,广州电子厂,3000.00,正常
+"""
+
+SAMPLE_PAYMENTS_PARTIAL_CSV = """payment_no,payment_date,customer,amount
+PAY001,2024-01-16,北京科技有限公司,1000.00
+PAY002,2024-01-17,上海贸易公司,2500.50
+"""
+
+SAMPLE_INVOICES_FULL_CSV = """invoice_no,invoice_date,customer,amount,status
+INV001,2024-01-15,北京科技有限公司,1000.00,正常
+INV002,2024-01-16,上海贸易公司,2500.50,正常
+"""
+
+SAMPLE_PAYMENTS_FULL_CSV = """payment_no,payment_date,customer,amount
+PAY001,2024-01-16,北京科技有限公司,1000.00
+PAY002,2024-01-17,上海贸易公司,2500.50
+"""
+
+
+class TestBatchWorkbenchRegressionUnmatchedExport(unittest.TestCase):
+    """未匹配项导出回归测试：覆盖有未匹配发票、有未匹配收款、无未匹配三种场景"""
+
+    def _make_config(self, test_dir):
+        return Config(
+            db_path=os.path.join(test_dir, "test.db"),
+            export_dir=os.path.join(test_dir, "exports"),
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+    def test_batch_with_unmatched_invoices(self):
+        """测试有未匹配发票的批次导出包含 unmatched_invoices"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            config = self._make_config(test_dir)
+            db = Database(config.db_path)
+            importer = CSVImporter(config, db)
+            matcher = MatchEngine(config, db, None)
+            exporter = ReportExporter(config, db)
+
+            inv_csv = os.path.join(test_dir, "inv.csv")
+            pay_csv = os.path.join(test_dir, "pay.csv")
+            with open(inv_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_INVOICES_PARTIAL_CSV)
+            with open(pay_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_PAYMENTS_PARTIAL_CSV)
+
+            inv = importer.import_invoices(inv_csv, "op")
+            importer.import_payments(pay_csv, "op")
+            inv_batch_id = inv["batch_id"]
+
+            matcher.run_auto_matching("op")
+
+            json_result = exporter.export_batch_progress(
+                inv_batch_id, "test_user", format="json"
+            )
+            self.assertTrue(json_result["success"])
+
+            with open(json_result["file_path"], "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.assertIn("unmatched_invoices", data, "JSON应包含 unmatched_invoices 字段")
+            self.assertIn("unmatched_payments", data, "JSON应包含 unmatched_payments 字段")
+            self.assertIsInstance(data["unmatched_invoices"], list)
+            self.assertIsInstance(data["unmatched_payments"], list)
+
+            self.assertGreater(len(data["unmatched_invoices"]), 0,
+                               "有3张发票只匹配了2笔，应有未匹配发票")
+
+            inv_fields = ["发票ID", "发票号", "发票日期", "客户", "发票金额",
+                          "发票状态", "匹配状态", "文件行号", "来源文件", "导入时间"]
+            for item in data["unmatched_invoices"]:
+                for field in inv_fields:
+                    self.assertIn(field, item, f"未匹配发票缺少字段: {field}")
+
+            self.assertEqual(
+                len(data["unmatched_invoices"]),
+                json_result["summary"]["unmatched_invoices_count"],
+                "summary中的unmatched_invoices_count应与实际导出数一致"
+            )
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_batch_with_unmatched_payments(self):
+        """测试有未匹配收款的批次导出包含 unmatched_payments"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            config = self._make_config(test_dir)
+            db = Database(config.db_path)
+            importer = CSVImporter(config, db)
+            matcher = MatchEngine(config, db, None)
+            exporter = ReportExporter(config, db)
+
+            inv_csv = os.path.join(test_dir, "inv.csv")
+            pay_csv = os.path.join(test_dir, "pay.csv")
+            with open(inv_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_INVOICES_FULL_CSV)
+            with open(pay_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_PAYMENTS_PARTIAL_CSV)
+
+            inv = importer.import_invoices(inv_csv, "op")
+            pay = importer.import_payments(pay_csv, "op")
+            inv_batch_id = inv["batch_id"]
+            pay_batch_id = pay["batch_id"]
+
+            matcher.run_auto_matching("op")
+
+            # 测试收款批次导出（收款3条>发票2条，应有未匹配收款）
+            json_result = exporter.export_batch_progress(
+                pay_batch_id, "test_user", format="json"
+            )
+            self.assertTrue(json_result["success"])
+
+            with open(json_result["file_path"], "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.assertIn("unmatched_invoices", data)
+            self.assertIn("unmatched_payments", data)
+
+            pay_fields = ["收款ID", "收款号", "收款日期", "客户", "收款金额",
+                          "收款状态", "匹配状态", "文件行号", "来源文件", "导入时间"]
+            for item in data["unmatched_payments"]:
+                for field in pay_fields:
+                    self.assertIn(field, item, f"未匹配收款缺少字段: {field}")
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_batch_with_no_unmatched(self):
+        """测试全部匹配的批次导出 unmatched_invoices/payments 为空列表"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            config = self._make_config(test_dir)
+            db = Database(config.db_path)
+            importer = CSVImporter(config, db)
+            matcher = MatchEngine(config, db, None)
+            exporter = ReportExporter(config, db)
+
+            inv_csv = os.path.join(test_dir, "inv.csv")
+            pay_csv = os.path.join(test_dir, "pay.csv")
+            with open(inv_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_INVOICES_FULL_CSV)
+            with open(pay_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_PAYMENTS_FULL_CSV)
+
+            inv = importer.import_invoices(inv_csv, "op")
+            importer.import_payments(pay_csv, "op")
+            inv_batch_id = inv["batch_id"]
+
+            matcher.run_auto_matching("op")
+
+            json_result = exporter.export_batch_progress(
+                inv_batch_id, "test_user", format="json"
+            )
+            self.assertTrue(json_result["success"])
+
+            with open(json_result["file_path"], "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.assertIn("unmatched_invoices", data)
+            self.assertIn("unmatched_payments", data)
+            self.assertEqual(len(data["unmatched_invoices"]), 0,
+                             "全部匹配时 unmatched_invoices 应为空列表")
+            self.assertEqual(len(data["unmatched_payments"]), 0,
+                             "全部匹配时 unmatched_payments 应为空列表")
+
+            self.assertEqual(json_result["summary"]["unmatched_invoices_count"], 0)
+            self.assertEqual(json_result["summary"]["unmatched_payments_count"], 0)
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_csv_export_includes_unmatched_sheets(self):
+        """测试CSV导出包含未匹配发票和未匹配收款文件"""
+        test_dir = tempfile.mkdtemp()
+        try:
+            config = self._make_config(test_dir)
+            db = Database(config.db_path)
+            importer = CSVImporter(config, db)
+            matcher = MatchEngine(config, db, None)
+            exporter = ReportExporter(config, db)
+
+            inv_csv = os.path.join(test_dir, "inv.csv")
+            pay_csv = os.path.join(test_dir, "pay.csv")
+            with open(inv_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_INVOICES_PARTIAL_CSV)
+            with open(pay_csv, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_PAYMENTS_PARTIAL_CSV)
+
+            inv = importer.import_invoices(inv_csv, "op")
+            importer.import_payments(pay_csv, "op")
+            inv_batch_id = inv["batch_id"]
+
+            matcher.run_auto_matching("op")
+
+            csv_result = exporter.export_batch_progress(
+                inv_batch_id, "test_user", format="csv"
+            )
+            self.assertTrue(csv_result["success"])
+
+            unmatched_inv_csv = os.path.join(csv_result["file_path"], "未匹配发票.csv")
+            unmatched_pay_csv = os.path.join(csv_result["file_path"], "未匹配收款.csv")
+
+            self.assertTrue(os.path.exists(unmatched_inv_csv), "未匹配发票.csv应存在")
+            self.assertTrue(os.path.exists(unmatched_pay_csv), "未匹配收款.csv应存在")
+
+            with open(unmatched_inv_csv, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                inv_rows = list(reader)
+            self.assertGreater(len(inv_rows), 0, "CSV中应有未匹配发票记录")
+
+            with open(unmatched_pay_csv, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                pay_rows = list(reader)
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

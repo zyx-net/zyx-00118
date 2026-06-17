@@ -1,0 +1,3 @@
+payment_no,payment_date,customer,amount
+RFPAY001,2024-02-16,Delta Co,1200.00
+RFPAY002,2024-02-17,Echo Co,800.00

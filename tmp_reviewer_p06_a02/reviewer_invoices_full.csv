@@ -1,0 +1,3 @@
+invoice_no,invoice_date,customer,amount,status
+RFINV001,2024-02-15,Delta Co,1200.00,normal
+RFINV002,2024-02-16,Echo Co,800.00,normal

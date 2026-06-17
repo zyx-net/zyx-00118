@@ -1,0 +1,3 @@
+payment_no,payment_date,customer,amount
+RPAY001,2024-01-16,Alpha Co,1000.00
+RPAY002,2024-01-17,Beta Co,2500.50
