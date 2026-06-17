@@ -4,7 +4,41 @@ import json
 from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 from .config import Config
-from .database import Database, INVOICE_STATUS_INVALID, PAYMENT_STATUS_INVALID
+from .database import (
+    Database,
+    INVOICE_STATUS_NORMAL,
+    INVOICE_STATUS_INVALID,
+    PAYMENT_STATUS_NORMAL,
+    PAYMENT_STATUS_INVALID,
+)
+
+STATUS_MAP_INVOICE = {
+    "正常": INVOICE_STATUS_NORMAL,
+    "normal": INVOICE_STATUS_NORMAL,
+    "作废": "invalid",
+    "invalid": INVOICE_STATUS_INVALID,
+}
+
+STATUS_MAP_PAYMENT = {
+    "正常": PAYMENT_STATUS_NORMAL,
+    "normal": PAYMENT_STATUS_NORMAL,
+    "作废": "invalid",
+    "invalid": PAYMENT_STATUS_INVALID,
+}
+
+STATUS_LABEL_INVOICE = {
+    INVOICE_STATUS_NORMAL: "正常",
+    "normal": "正常",
+    INVOICE_STATUS_INVALID: "作废",
+    "invalid": "作废",
+}
+
+STATUS_LABEL_PAYMENT = {
+    PAYMENT_STATUS_NORMAL: "正常",
+    "normal": "正常",
+    PAYMENT_STATUS_INVALID: "作废",
+    "invalid": "作废",
+}
 
 
 ERROR_TYPE_MISSING_COLUMN = "missing_column"
@@ -13,6 +47,18 @@ ERROR_TYPE_INVALID_AMOUNT = "invalid_amount"
 ERROR_TYPE_INVALID_DATE = "invalid_date"
 ERROR_TYPE_MISSING_REQUIRED = "missing_required"
 ERROR_TYPE_DUPLICATE = "duplicate"
+
+CONFLICT_TYPE_NEW_RECORD = "new_record"
+CONFLICT_TYPE_STATUS_CHANGE = "status_change"
+CONFLICT_TYPE_DUPLICATE_PROCESS = "duplicate_process"
+CONFLICT_TYPE_AMOUNT_CHANGE = "amount_change"
+
+CONFLICT_TYPE_LABELS = {
+    CONFLICT_TYPE_NEW_RECORD: "新增记录",
+    CONFLICT_TYPE_STATUS_CHANGE: "状态冲突",
+    CONFLICT_TYPE_DUPLICATE_PROCESS: "重复处理",
+    CONFLICT_TYPE_AMOUNT_CHANGE: "金额变更",
+}
 
 
 class CSVImporter:
@@ -69,6 +115,7 @@ class CSVImporter:
 
             success_count = 0
             failed_count = 0
+            conflict_count = 0
 
             for idx, row in enumerate(rows, start=2):
                 result = self._validate_and_insert_row(
@@ -86,6 +133,13 @@ class CSVImporter:
 
             self.db.update_batch_stats(batch_id, success_count, failed_count)
 
+            conflicts = self._detect_batch_conflicts(batch_id, file_type, operator)
+            conflict_count = len(conflicts)
+
+            message = f"导入完成：成功 {success_count} 条，失败 {failed_count} 条"
+            if conflict_count > 0:
+                message += f"，检测到 {conflict_count} 个冲突"
+
             return {
                 "success": True,
                 "skipped": False,
@@ -93,8 +147,349 @@ class CSVImporter:
                 "total_rows": total_rows,
                 "success_rows": success_count,
                 "failed_rows": failed_count,
-                "message": f"导入完成：成功 {success_count} 条，失败 {failed_count} 条"
+                "conflict_count": conflict_count,
+                "conflicts": conflicts,
+                "message": message
             }
+
+    def _detect_batch_conflicts(self, batch_id: int, file_type: str,
+                                 new_operator: str = None) -> List[Dict]:
+        from .database import (
+            MATCH_STATUS_MATCHED,
+            MATCH_STATUS_PENDING,
+            MATCH_STATUS_EXCEPTION,
+            MATCH_STATUS_REVOKED,
+            MATCH_STATUS_UNMATCHED,
+        )
+
+        conflicts = []
+        existing_records = {}
+
+        all_batches = self.db.get_batches()
+        prev_batches = [b for b in all_batches
+                         if b["file_type"] == file_type and b["id"] < batch_id]
+
+        if not prev_batches:
+            return conflicts
+
+        prev_batch_ids = [b["id"] for b in prev_batches]
+
+        if file_type == "invoice":
+            for prev_batch_id in prev_batch_ids:
+                with self.db._get_conn() as conn:
+                    rows = conn.execute(
+                        """SELECT id, invoice_no, amount, match_status, status
+                           FROM invoices WHERE batch_id = ?""",
+                        (prev_batch_id,)
+                    ).fetchall()
+                    for r in rows:
+                        existing_records[r["invoice_no"]] = {
+                            "id": r["id"],
+                            "amount": r["amount"],
+                            "match_status": r["match_status"],
+                            "status": r["status"],
+                            "batch_id": prev_batch_id,
+                        }
+
+            with self.db._get_conn() as conn:
+                new_rows = conn.execute(
+                    """SELECT id, invoice_no, amount, match_status, status
+                       FROM invoices WHERE batch_id = ?""",
+                    (batch_id,)
+                ).fetchall()
+
+            for r in new_rows:
+                invoice_no = r["invoice_no"]
+                new_amount = r["amount"]
+                new_match_status = r["match_status"]
+                new_inv_status = r["status"]
+
+                if invoice_no not in existing_records:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_NEW_RECORD,
+                        record_type="invoice",
+                        record_no=invoice_no,
+                        conflict_reason=f"发票 {invoice_no} 为本次导入新增记录，之前批次中不存在",
+                        new_amount=new_amount,
+                        new_status=new_match_status,
+                        new_operator=new_operator,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_NEW_RECORD,
+                        "record_type": "invoice",
+                        "record_no": invoice_no,
+                        "conflict_reason": f"发票 {invoice_no} 为本次导入新增记录",
+                        "old_amount": None,
+                        "new_amount": new_amount,
+                        "old_status": None,
+                        "new_status": new_inv_status,
+                        "old_operator": None,
+                        "new_operator": new_operator,
+                    })
+                    continue
+
+                existing = existing_records[invoice_no]
+                old_amount = existing["amount"]
+                old_match_status = existing["match_status"]
+                old_inv_status = existing["status"]
+                old_operator = None
+
+                with self.db._get_conn() as conn:
+                    match_row = conn.execute(
+                        """SELECT m.operator FROM matches m
+                           JOIN invoices i ON m.invoice_id = i.id
+                           WHERE i.id = ? AND m.status != 'revoked'
+                           ORDER BY m.id DESC LIMIT 1""",
+                        (existing["id"],)
+                    ).fetchone()
+                    if match_row:
+                        old_operator = match_row["operator"]
+
+                if abs(new_amount - old_amount) > 0.001:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_AMOUNT_CHANGE,
+                        record_type="invoice",
+                        record_no=invoice_no,
+                        conflict_reason=f"发票 {invoice_no} 金额变更: 旧 {old_amount:.2f} -> 新 {new_amount:.2f}",
+                        old_amount=old_amount,
+                        new_amount=new_amount,
+                        old_status=old_inv_status,
+                        new_status=new_inv_status,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_AMOUNT_CHANGE,
+                        "record_type": "invoice",
+                        "record_no": invoice_no,
+                        "conflict_reason": f"发票 {invoice_no} 金额从 {old_amount:.2f} 变为 {new_amount:.2f}",
+                        "old_amount": old_amount,
+                        "new_amount": new_amount,
+                        "old_status": old_inv_status,
+                        "new_status": new_inv_status,
+                        "old_operator": old_operator,
+                        "new_operator": new_operator,
+                    })
+
+                if old_inv_status != new_inv_status and old_inv_status is not None:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_STATUS_CHANGE,
+                        record_type="invoice",
+                        record_no=invoice_no,
+                        conflict_reason=f"发票 {invoice_no} 状态冲突: 旧状态 {old_inv_status}，新导入后为 {new_inv_status}",
+                        old_status=old_inv_status,
+                        new_status=new_inv_status,
+                        old_operator=old_operator,
+                        new_operator=new_operator,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_STATUS_CHANGE,
+                        "record_type": "invoice",
+                        "record_no": invoice_no,
+                        "conflict_reason": f"发票 {invoice_no} 状态从 {old_inv_status} 变为 {new_inv_status}",
+                        "old_amount": old_amount,
+                        "new_amount": new_amount,
+                        "old_status": old_inv_status,
+                        "new_status": new_inv_status,
+                        "old_operator": old_operator,
+                        "new_operator": new_operator,
+                    })
+
+                if old_operator and new_operator and old_operator != new_operator and old_match_status == MATCH_STATUS_MATCHED:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_DUPLICATE_PROCESS,
+                        record_type="invoice",
+                        record_no=invoice_no,
+                        conflict_reason=f"发票 {invoice_no} 已被 {old_operator} 处理，现由 {new_operator} 重新处理",
+                        old_status=old_inv_status,
+                        new_status=new_inv_status,
+                        old_operator=old_operator,
+                        new_operator=new_operator,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_DUPLICATE_PROCESS,
+                        "record_type": "invoice",
+                        "record_no": invoice_no,
+                        "conflict_reason": f"发票 {invoice_no} 已被 {old_operator} 处理，现由 {new_operator} 重新处理",
+                        "old_amount": old_amount,
+                        "new_amount": new_amount,
+                        "old_status": old_inv_status,
+                        "new_status": new_inv_status,
+                        "old_operator": old_operator,
+                        "new_operator": new_operator,
+                    })
+
+        else:
+            for prev_batch_id in prev_batch_ids:
+                with self.db._get_conn() as conn:
+                    rows = conn.execute(
+                        """SELECT id, payment_no, amount, match_status, status
+                           FROM payments WHERE batch_id = ?""",
+                        (prev_batch_id,)
+                    ).fetchall()
+                    for r in rows:
+                        existing_records[r["payment_no"]] = {
+                            "id": r["id"],
+                            "amount": r["amount"],
+                            "match_status": r["match_status"],
+                            "status": r["status"],
+                            "batch_id": prev_batch_id,
+                        }
+
+            with self.db._get_conn() as conn:
+                new_rows = conn.execute(
+                    """SELECT id, payment_no, amount, match_status, status
+                       FROM payments WHERE batch_id = ?""",
+                    (batch_id,)
+                ).fetchall()
+
+            for r in new_rows:
+                payment_no = r["payment_no"]
+                new_amount = r["amount"]
+                new_match_status = r["match_status"]
+                new_pay_status = r["status"]
+
+                if payment_no not in existing_records:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_NEW_RECORD,
+                        record_type="payment",
+                        record_no=payment_no,
+                        conflict_reason=f"收款 {payment_no} 为本次导入新增记录，之前批次中不存在",
+                        new_amount=new_amount,
+                        new_status=new_match_status,
+                        new_operator=new_operator,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_NEW_RECORD,
+                        "record_type": "payment",
+                        "record_no": payment_no,
+                        "conflict_reason": f"收款 {payment_no} 为本次导入新增记录",
+                        "old_amount": None,
+                        "new_amount": new_amount,
+                        "old_status": None,
+                        "new_status": new_pay_status,
+                        "old_operator": None,
+                        "new_operator": new_operator,
+                    })
+                    continue
+
+                existing = existing_records[payment_no]
+                old_amount = existing["amount"]
+                old_match_status = existing["match_status"]
+                old_pay_status = existing["status"]
+                old_operator = None
+
+                with self.db._get_conn() as conn:
+                    match_row = conn.execute(
+                        """SELECT m.operator FROM matches m
+                           JOIN payments p ON m.payment_id = p.id
+                           WHERE p.id = ? AND m.status != 'revoked'
+                           ORDER BY m.id DESC LIMIT 1""",
+                        (existing["id"],)
+                    ).fetchone()
+                    if match_row:
+                        old_operator = match_row["operator"]
+
+                if abs(new_amount - old_amount) > 0.001:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_AMOUNT_CHANGE,
+                        record_type="payment",
+                        record_no=payment_no,
+                        conflict_reason=f"收款 {payment_no} 金额变更: 旧 {old_amount:.2f} -> 新 {new_amount:.2f}",
+                        old_amount=old_amount,
+                        new_amount=new_amount,
+                        old_status=old_pay_status,
+                        new_status=new_pay_status,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_AMOUNT_CHANGE,
+                        "record_type": "payment",
+                        "record_no": payment_no,
+                        "conflict_reason": f"收款 {payment_no} 金额从 {old_amount:.2f} 变为 {new_amount:.2f}",
+                        "old_amount": old_amount,
+                        "new_amount": new_amount,
+                        "old_status": old_pay_status,
+                        "new_status": new_pay_status,
+                        "old_operator": old_operator,
+                        "new_operator": new_operator,
+                    })
+
+                if (old_pay_status != new_pay_status and old_pay_status is not None) or \
+                   (old_match_status != new_match_status and old_match_status != MATCH_STATUS_UNMATCHED):
+                    old_s = old_pay_status if old_pay_status != new_pay_status else old_match_status
+                    new_s = new_pay_status if old_pay_status != new_pay_status else new_match_status
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_STATUS_CHANGE,
+                        record_type="payment",
+                        record_no=payment_no,
+                        conflict_reason=f"收款 {payment_no} 状态冲突: 旧状态 {old_s}，新导入后为 {new_s}",
+                        old_status=old_pay_status,
+                        new_status=new_pay_status,
+                        old_operator=old_operator,
+                        new_operator=new_operator,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_STATUS_CHANGE,
+                        "record_type": "payment",
+                        "record_no": payment_no,
+                        "conflict_reason": f"收款 {payment_no} 状态从 {old_s} 变为 {new_s}",
+                        "old_amount": old_amount,
+                        "new_amount": new_amount,
+                        "old_status": old_pay_status,
+                        "new_status": new_pay_status,
+                        "old_operator": old_operator,
+                        "new_operator": new_operator,
+                    })
+
+                if old_operator and new_operator and old_operator != new_operator and old_match_status == MATCH_STATUS_MATCHED:
+                    conflict_id = self.db.insert_batch_conflict(
+                        batch_id=batch_id,
+                        conflict_type=CONFLICT_TYPE_DUPLICATE_PROCESS,
+                        record_type="payment",
+                        record_no=payment_no,
+                        conflict_reason=f"收款 {payment_no} 已被 {old_operator} 处理，现由 {new_operator} 重新处理",
+                        old_status=old_pay_status,
+                        new_status=new_pay_status,
+                        old_operator=old_operator,
+                        new_operator=new_operator,
+                    )
+                    conflicts.append({
+                        "conflict_id": conflict_id,
+                        "conflict_type": CONFLICT_TYPE_DUPLICATE_PROCESS,
+                        "record_type": "payment",
+                        "record_no": payment_no,
+                        "conflict_reason": f"收款 {payment_no} 已被 {old_operator} 处理，现由 {new_operator} 重新处理",
+                        "old_amount": old_amount,
+                        "new_amount": new_amount,
+                        "old_status": old_pay_status,
+                        "new_status": new_pay_status,
+                        "old_operator": old_operator,
+                        "new_operator": new_operator,
+                    })
+
+        for c in conflicts:
+            if c["record_type"] == "invoice":
+                label_map = STATUS_LABEL_INVOICE
+            else:
+                label_map = STATUS_LABEL_PAYMENT
+            if c["old_status"] is not None:
+                c["old_status"] = label_map.get(c["old_status"], c["old_status"])
+            if c["new_status"] is not None:
+                c["new_status"] = label_map.get(c["new_status"], c["new_status"])
+
+        return conflicts
 
     def _validate_and_insert_row(self, batch_id: int, file_row_num: int,
                                  row: Dict, file_type: str,
@@ -160,9 +555,11 @@ class CSVImporter:
                 "error_message": f"日期格式错误: {invoice_date_str}，请使用 YYYY-MM-DD 或 YYYY/MM/DD 格式"
             }
 
+        status_raw = row.get("status", "正常")
+        status = STATUS_MAP_INVOICE.get(status_raw, INVOICE_STATUS_NORMAL)
         self.db.insert_invoice(
             batch_id, file_row_num, invoice_no, invoice_date, customer,
-            amount, raw_data
+            amount, raw_data, status
         )
         return {"success": True}
 
@@ -208,9 +605,11 @@ class CSVImporter:
                 "error_message": f"日期格式错误: {payment_date_str}，请使用 YYYY-MM-DD 或 YYYY/MM/DD 格式"
             }
 
+        status_raw = row.get("status", "正常")
+        status = STATUS_MAP_PAYMENT.get(status_raw, PAYMENT_STATUS_NORMAL)
         self.db.insert_payment(
             batch_id, file_row_num, payment_no, payment_date, customer,
-            amount, raw_data
+            amount, raw_data, status
         )
         return {"success": True}
 

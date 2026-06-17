@@ -276,6 +276,36 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_lock_history_match ON lock_history(match_id);
                 CREATE INDEX IF NOT EXISTS idx_lock_history_action ON lock_history(action);
                 CREATE INDEX IF NOT EXISTS idx_lock_history_operator ON lock_history(operator);
+
+                CREATE TABLE IF NOT EXISTS batch_conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL,
+                    conflict_type TEXT NOT NULL,
+                    record_type TEXT NOT NULL,
+                    record_no TEXT NOT NULL,
+                    old_status TEXT,
+                    new_status TEXT,
+                    old_operator TEXT,
+                    new_operator TEXT,
+                    old_amount REAL,
+                    new_amount REAL,
+                    conflict_reason TEXT NOT NULL,
+                    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (batch_id) REFERENCES import_batches(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_batch_conflicts_batch ON batch_conflicts(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_batch_conflicts_type ON batch_conflicts(conflict_type);
+                CREATE INDEX IF NOT EXISTS idx_batch_conflicts_record ON batch_conflicts(record_no);
+
+                CREATE TABLE IF NOT EXISTS session_state (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT UNIQUE NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_session_state_key ON session_state(key);
             """)
 
     @staticmethod
@@ -1458,3 +1488,138 @@ class Database:
             match["is_lock_expired"] = False
 
         return match
+
+    def insert_batch_conflict(self, batch_id: int, conflict_type: str, record_type: str,
+                              record_no: str, conflict_reason: str,
+                              old_status: str = None, new_status: str = None,
+                              old_operator: str = None, new_operator: str = None,
+                              old_amount: float = None, new_amount: float = None) -> int:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO batch_conflicts
+                   (batch_id, conflict_type, record_type, record_no,
+                    conflict_reason, old_status, new_status,
+                    old_operator, new_operator, old_amount, new_amount)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, conflict_type, record_type, record_no,
+                 conflict_reason, old_status, new_status,
+                 old_operator, new_operator, old_amount, new_amount)
+            )
+            return cursor.lastrowid
+
+    def get_batch_conflicts(self, batch_id: int = None, conflict_type: str = None) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = """SELECT bc.*, b.file_name, b.file_type, b.imported_at
+                     FROM batch_conflicts bc
+                     JOIN import_batches b ON bc.batch_id = b.id
+                     WHERE 1=1"""
+            params = []
+            if batch_id:
+                sql += " AND bc.batch_id = ?"
+                params.append(batch_id)
+            if conflict_type:
+                sql += " AND bc.conflict_type = ?"
+                params.append(conflict_type)
+            sql += " ORDER BY bc.detected_at DESC"
+
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def set_session_state(self, key: str, value: Any) -> None:
+        import json
+        value_str = json.dumps(value, ensure_ascii=False)
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO session_state (key, value)
+                   VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                   value = excluded.value,
+                   updated_at = CURRENT_TIMESTAMP""",
+                (key, value_str)
+            )
+
+    def get_session_state(self, key: str, default: Any = None) -> Any:
+        import json
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM session_state WHERE key = ?",
+                (key,)
+            ).fetchone()
+            if not row:
+                return default
+            try:
+                return json.loads(row["value"])
+            except (json.JSONDecodeError, TypeError):
+                return row["value"]
+
+    def clear_session_state(self, key: str = None) -> None:
+        with self._get_conn() as conn:
+            if key:
+                conn.execute("DELETE FROM session_state WHERE key = ?", (key,))
+            else:
+                conn.execute("DELETE FROM session_state")
+
+    def get_batch_summary(self, batch_id: int = None) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = """
+                SELECT
+                    b.id as batch_id,
+                    b.file_type,
+                    b.file_name,
+                    b.total_rows,
+                    b.success_rows,
+                    b.failed_rows,
+                    b.operator,
+                    b.imported_at,
+                    COUNT(DISTINCT CASE WHEN i.match_status = 'matched' THEN i.id END) as matched_invoices,
+                    COUNT(DISTINCT CASE WHEN i.match_status = 'unmatched' AND i.status = 'normal' THEN i.id END) as unmatched_invoices,
+                    COUNT(DISTINCT CASE WHEN p.match_status = 'matched' THEN p.id END) as matched_payments,
+                    COUNT(DISTINCT CASE WHEN p.match_status = 'unmatched' AND p.status = 'normal' THEN p.id END) as unmatched_payments,
+                    COUNT(DISTINCT CASE WHEN m.status = 'pending' THEN m.id END) as pending_matches,
+                    COUNT(DISTINCT CASE WHEN m.status = 'matched' THEN m.id END) as confirmed_matches,
+                    COUNT(DISTINCT CASE WHEN m.status = 'exception' THEN m.id END) as exception_matches,
+                    COUNT(DISTINCT CASE WHEN m.status = 'revoked' THEN m.id END) as revoked_matches,
+                    COUNT(DISTINCT bc.id) as conflict_count
+                FROM import_batches b
+                LEFT JOIN invoices i ON i.batch_id = b.id
+                LEFT JOIN payments p ON p.batch_id = b.id
+                LEFT JOIN matches m ON m.invoice_id = i.id OR m.payment_id = p.id
+                LEFT JOIN batch_conflicts bc ON bc.batch_id = b.id
+            """
+            params = ()
+            if batch_id:
+                sql += " WHERE b.id = ?"
+                params = (batch_id,)
+            sql += " GROUP BY b.id ORDER BY b.imported_at DESC"
+
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_matches_by_batch(self, batch_id: int, status: str = None,
+                             operator: str = None) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = """
+                SELECT DISTINCT m.*,
+                       i.invoice_no, i.invoice_date, i.customer as inv_customer,
+                       i.amount as inv_amount, i.batch_id as inv_batch_id,
+                       p.payment_no, p.payment_date, p.customer as pay_customer,
+                       p.amount as pay_amount, p.batch_id as pay_batch_id,
+                       ib.file_name as inv_file, pb.file_name as pay_file
+                FROM matches m
+                JOIN invoices i ON m.invoice_id = i.id
+                JOIN payments p ON m.payment_id = p.id
+                LEFT JOIN import_batches ib ON i.batch_id = ib.id
+                LEFT JOIN import_batches pb ON p.batch_id = pb.id
+                WHERE (i.batch_id = ? OR p.batch_id = ?)
+            """
+            params = [batch_id, batch_id]
+            if status:
+                sql += " AND m.status = ?"
+                params.append(status)
+            if operator:
+                sql += " AND m.operator = ?"
+                params.append(operator)
+            sql += " ORDER BY m.created_at DESC"
+
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]

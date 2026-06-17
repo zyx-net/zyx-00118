@@ -23,6 +23,11 @@
 - **重启恢复**：锁状态持久化到数据库，程序重启后自动恢复
 - **操作审计**：完整的锁历史和状态历史，支持追溯
 - **导出增强**：JSON/CSV/快照导出包含责任人、锁历史、接管原因、确认证据
+- **批次工作台**：批次摘要视图、进度百分比、未完成项提醒、一键导出进度
+- **按处理人过滤**：支持按操作者筛选匹配记录，方便个人工作区
+- **重启恢复上下文**：自动恢复上次打开的批次和筛选条件，避免重新找上下文
+- **导入冲突检测**：同一批次重新导入时检测新增记录、状态冲突、金额变更、重复处理
+- **冲突信息导出**：冲突和差异信息自动带入 JSON/CSV 导出，方便追溯
 
 ## 安装
 
@@ -232,6 +237,89 @@ python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sa
 # 再次运行匹配（应从上次状态继续）
 python -m invoice_reconciler.cli.main match --operator 李四
 ```
+
+### 15. 批次工作台 - 从导入到导出完整可跑命令链
+
+> **批次工作台专为方便交接设计**：程序重启自动恢复上次打开的批次和筛选条件，
+> 重新导入自动检测冲突，一键导出完整进度（含差异和冲突信息）。
+
+```bash
+# ========= 步骤 1：导入数据（发票 + 收款）
+# 导入发票台账
+python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 张三
+# 导入收款流水
+python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sample_payments.csv --operator 张三
+
+# ========= 步骤 2：查看所有批次列表
+python -m invoice_reconciler.cli.main batch list
+
+# ========= 步骤 3：选择当前处理批次（程序重启后自动恢复）
+# 选择批次 #1（根据上面 list 的 ID）
+python -m invoice_reconciler.cli.main batch select 1 --operator 张三
+
+# ========= 步骤 4：设置筛选条件（程序重启后自动恢复）
+# 按处理人过滤（只看张三处理的）
+python -m invoice_reconciler.cli.main batch filter --operator 张三
+# 按状态过滤（只看待确认的）
+python -m invoice_reconciler.cli.main batch filter --status pending
+
+# ========= 步骤 5：查看批次工作台摘要（进度条 + 待办提醒）
+python -m invoice_reconciler.cli.main batch summary --batch-id 1
+
+# ========= 步骤 6：运行自动匹配
+python -m invoice_reconciler.cli.main match --operator 张三
+
+# ========= 步骤 7：查看未完成项提醒
+python -m invoice_reconciler.cli.main batch reminders
+
+# ========= 步骤 8：人工确认匹配（先锁定再操作）
+# 先查看待确认列表
+python -m invoice_reconciler.cli.main confirm list --status pending
+# 锁定记录
+python -m invoice_reconciler.cli.main lock acquire 1 --operator 张三 --reason "核对中"
+# 确认匹配
+python -m invoice_reconciler.cli.main confirm approve 1 --operator 张三 --remark "核对无误"
+
+# ========= 步骤 9：重新导入更新版文件（自动检测冲突）
+# 模拟业务场景：财务发来更新版发票台账，包含新增、状态变更、金额变更
+python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 李四
+
+# ========= 步骤 10：查看冲突明细
+python -m invoice_reconciler.cli.main batch conflicts
+# 按类型过滤冲突
+python -m invoice_reconciler.cli.main batch conflicts --conflict-type status_change
+
+# ========= 步骤 11：一键导出批次进度（含冲突信息）
+# JSON 格式（结构化数据，方便程序处理）
+python -m invoice_reconciler.cli.main batch export-progress 1 --operator 张三 --format json
+# Excel 格式（带格式报表，方便交接）
+python -m invoice_reconciler.cli.main batch export-progress 1 --operator 张三 --format xlsx
+# CSV 格式
+python -m invoice_reconciler.cli.main batch export-progress 1 --operator 张三 --format csv
+
+# ========= 步骤 12：撤销某个已确认的匹配（测试撤销后再次导出）
+python -m invoice_reconciler.cli.main lock acquire 1 --operator 张三 --reason "发现错误需撤销"
+python -m invoice_reconciler.cli.main revoke match 1 --operator 张三 --remark "客户名称有误"
+
+# ========= 步骤 13：再次导出进度（验证撤销后导出结果一致）
+python -m invoice_reconciler.cli.main batch export-progress 1 --operator 张三 --format json
+
+# ========= 步骤 14：模拟程序重启 - 自动恢复上下文
+# 退出程序后重新运行任意命令，会自动显示上次的批次和筛选条件
+python -m invoice_reconciler.cli.main batch summary
+
+# ========= 步骤 15：手动恢复会话状态
+python -m invoice_reconciler.cli.main batch restore
+
+# ========= 步骤 16：清除会话状态（不恢复）
+python -m invoice_reconciler.cli.main batch clear-state
+```
+
+**导出内容说明：**
+- **批次摘要 Sheet：批次信息、进度百分比、各状态计数
+- **匹配明细 Sheet**: 所有匹配记录（带处理人、状态、操作时间）
+- **批次冲突 Sheet**: 所有冲突记录（新增记录、状态冲突、金额变更、重复处理）
+- **JSON 格式**：包含完整的结构化数据，含 batch_info、progress、matches、conflicts
 
 ## 配置说明
 

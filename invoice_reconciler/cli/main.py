@@ -38,6 +38,10 @@ from invoice_reconciler.core.workflow import (
     LOCK_STATUS_LABELS,
     USER_ROLE_LABELS,
 )
+from invoice_reconciler.core.batch_workbench import (
+    BatchWorkbench,
+    CONFLICT_TYPE_LABELS,
+)
 
 
 def get_current_user() -> str:
@@ -85,6 +89,27 @@ def cli(ctx, config_path):
                 f"配置超时: {restore_result.get('config_timeout', 'N/A')} 秒",
                 fg="yellow"
             ))
+        workbench = BatchWorkbench(config, db)
+        restore_workbench = workbench.restore_workbench_state()
+        if restore_workbench.get("restored") and restore_workbench.get("last_batch"):
+            lb = restore_workbench["last_batch"]
+            click.echo(click.style(
+                f"[会话恢复] 上次打开批次: #{lb['batch_id']} - {lb['file_name']} ({lb['file_type']})",
+                fg="yellow"
+            ))
+            if restore_workbench.get("filters"):
+                filters = restore_workbench["filters"]
+                filter_parts = []
+                if filters.get("operator"):
+                    filter_parts.append(f"处理人: {filters['operator']}")
+                if filters.get("status"):
+                    filter_parts.append(f"状态: {STATUS_LABELS.get(filters['status'], filters['status'])}")
+                if filter_parts:
+                    click.echo(click.style(
+                        f"[会话恢复] 筛选条件: {', '.join(filter_parts)}",
+                        fg="yellow"
+                    ))
+
         ctx.obj = {
             "config": config,
             "db": db,
@@ -94,6 +119,7 @@ def cli(ctx, config_path):
             "revoker": Revoker(db, config, workflow),
             "exporter": ReportExporter(config, db),
             "reviewer": ReviewSnapshot(db),
+            "workbench": workbench,
         }
     except Exception as e:
         click.echo(f"初始化失败: {e}", err=True)
@@ -185,6 +211,16 @@ def import_invoices(ctx, file_path, operator, preview):
             click.echo(click.style(result["message"], fg="green"))
         click.echo(f"批次ID: {result['batch_id']}")
         click.echo(f"总计: {result['total_rows']}, 成功: {result['success_rows']}, 失败: {result['failed_rows']}")
+
+        if result.get("conflicts"):
+            conflicts = result["conflicts"]
+            click.echo()
+            click.echo(click.style(f"⚠ 检测到 {len(conflicts)} 个差异或冲突:", fg="yellow", bold=True))
+            for c in conflicts:
+                c_type = CONFLICT_TYPE_LABELS.get(c["conflict_type"], c["conflict_type"])
+                record_type = "发票" if c["record_type"] == "invoice" else "收款"
+                click.echo(f"  • [{c_type}] {record_type} {c['record_no']}: {c['conflict_reason']}")
+            click.echo(click.style("详细冲突信息已记录到数据库，可通过 `batch conflicts` 命令查看", fg="yellow"))
     except Exception as e:
         click.echo(click.style(f"导入失败: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -222,6 +258,16 @@ def import_payments(ctx, file_path, operator, preview):
             click.echo(click.style(result["message"], fg="green"))
         click.echo(f"批次ID: {result['batch_id']}")
         click.echo(f"总计: {result['total_rows']}, 成功: {result['success_rows']}, 失败: {result['failed_rows']}")
+
+        if result.get("conflicts"):
+            conflicts = result["conflicts"]
+            click.echo()
+            click.echo(click.style(f"⚠ 检测到 {len(conflicts)} 个差异或冲突:", fg="yellow", bold=True))
+            for c in conflicts:
+                c_type = CONFLICT_TYPE_LABELS.get(c["conflict_type"], c["conflict_type"])
+                record_type = "发票" if c["record_type"] == "invoice" else "收款"
+                click.echo(f"  • [{c_type}] {record_type} {c['record_no']}: {c['conflict_reason']}")
+            click.echo(click.style("详细冲突信息已记录到数据库，可通过 `batch conflicts` 命令查看", fg="yellow"))
     except Exception as e:
         click.echo(click.style(f"导入失败: {e}", fg="red"), err=True)
         sys.exit(1)
@@ -1383,6 +1429,342 @@ def user_info(ctx, username):
     click.echo(f"总锁定数: {summary['total_locks']}")
     click.echo(f"有效锁: {summary['active_locks']}")
     click.echo(f"已过期: {summary['expired_locks']}")
+
+
+@cli.group()
+def batch():
+    """批次工作台管理"""
+    pass
+
+
+@batch.command("summary")
+@click.option("--batch-id", type=int, default=None, help="指定批次ID，默认显示所有批次")
+@click.option("--operator", default=None, help="按处理人过滤")
+@click.option("--status", default=None,
+              type=click.Choice(["pending", "matched", "exception", "revoked"]),
+              help="按状态过滤")
+@click.pass_context
+def batch_summary(ctx, batch_id, operator, status):
+    """批次工作台摘要视图"""
+    workbench = ctx.obj["workbench"]
+    db = ctx.obj["db"]
+
+    if batch_id:
+        workbench.save_last_selected_batch(batch_id, get_current_user())
+
+    result = workbench.get_batch_workbench_summary(batch_id=batch_id)
+
+    if not result["success"]:
+        click.echo(click.style(result["message"], fg="yellow"))
+        return
+
+    click.echo(click.style(f"=== 批次工作台摘要 ({result['total_batches']} 个批次) ===", fg="cyan", bold=True))
+
+    for batch in result["batches"]:
+        click.echo()
+        click.echo(click.style(f"━━━ 批次 #{batch['batch_id']}: {batch['file_name']} ━━━", fg="white", bold=True))
+        click.echo(f"  类型: {batch['file_type']} | 操作人: {batch['operator']} | 导入时间: {batch['imported_at']}")
+        click.echo(f"  导入: 总计 {batch['total_rows']} 行 | 成功 {batch['success_rows']} 行 | 失败 {batch['failed_rows']} 行")
+        click.echo()
+
+        click.echo(click.style("  匹配进度:", fg="cyan"))
+        click.echo(f"    已确认: {batch['confirmed_matches']} | 待确认: {batch['pending_matches']} | "
+                   f"异常: {batch['exception_matches']} | 已撤销: {batch['revoked_matches']}")
+        click.echo(f"    已匹配发票: {batch['matched_invoices']} / 未匹配: {batch['unmatched_invoices']}")
+        click.echo(f"    已匹配收款: {batch['matched_payments']} / 未匹配: {batch['unmatched_payments']}")
+        click.echo(f"    冲突数量: {batch['conflict_count']}")
+        click.echo()
+
+        progress_bar = ""
+        progress = batch["progress_percent"]
+        filled = int(progress / 5)
+        progress_bar = "█" * filled + "░" * (20 - filled)
+        click.echo(f"  总进度: {progress_bar} {progress:.1f}%")
+
+        if batch["has_unfinished"]:
+            click.echo()
+            click.echo(click.style("  ⚠ 待处理项:", fg="yellow", bold=True))
+            for item in batch["unfinished_items"]:
+                click.echo(f"    • {item}")
+
+        if batch["conflict_count"] > 0:
+            click.echo()
+            click.echo(click.style("  🔴 冲突明细:", fg="red", bold=True))
+            for c in batch["conflicts"]:
+                conflict_type = CONFLICT_TYPE_LABELS.get(c["conflict_type"], c["conflict_type"])
+                click.echo(f"    [{c['detected_at']}] {conflict_type}: {c['conflict_reason']}")
+
+        if batch_id and batch["total_tasks"] > 0:
+            filters = workbench.get_filters()
+            matches = workbench.get_batch_matches(
+                batch_id,
+                status=filters.get("status") or status,
+                operator=filters.get("operator") or operator
+            )
+            if matches:
+                click.echo()
+                click.echo(click.style(f"  匹配明细 ({len(matches)} 条):", fg="cyan"))
+                headers = ["ID", "匹配编号", "类型", "状态", "发票号", "金额", "收款号", "金额", "处理人"]
+                rows = []
+                for m in matches:
+                    rows.append([
+                        m["id"],
+                        m["match_no"],
+                        MATCH_TYPE_LABELS.get(m["match_type"], m["match_type"]),
+                        STATUS_LABELS.get(m["status"], m["status"]),
+                        m["invoice_no"],
+                        f"{m['inv_amount']:.2f}",
+                        m["payment_no"],
+                        f"{m['pay_amount']:.2f}",
+                        m.get("operator") or "-",
+                    ])
+                print_table(headers, rows[:15])
+                if len(matches) > 15:
+                    click.echo(f"  ... 还有 {len(matches) - 15} 条")
+
+
+@batch.command("select")
+@click.argument("batch_id", type=int)
+@click.option("--operator", default=None, help="当前操作者")
+@click.pass_context
+def batch_select(ctx, batch_id, operator):
+    """选择当前处理的批次（程序重启后自动恢复）"""
+    workbench = ctx.obj["workbench"]
+    db = ctx.obj["db"]
+
+    batch_info = db.get_batch(batch_id)
+    if not batch_info:
+        click.echo(click.style(f"批次不存在: {batch_id}", fg="red"), err=True)
+        sys.exit(1)
+
+    operator = operator or get_current_user()
+    workbench.save_last_selected_batch(batch_id, operator)
+
+    file_type = "发票" if batch_info["file_type"] == "invoice" else "收款"
+    click.echo(click.style(f"[OK] 已选择批次 #{batch_id}: {batch_info['file_name']} ({file_type})", fg="green"))
+    click.echo("程序重启后将自动恢复到此批次上下文")
+
+
+@batch.command("filter")
+@click.option("--operator", default=None, help="按处理人过滤")
+@click.option("--status", default=None,
+              type=click.Choice(["pending", "matched", "exception", "revoked"]),
+              help="按状态过滤")
+@click.option("--clear", is_flag=True, help="清除所有筛选条件")
+@click.pass_context
+def batch_filter(ctx, operator, status, clear):
+    """设置筛选条件（程序重启后自动恢复）"""
+    workbench = ctx.obj["workbench"]
+
+    if clear:
+        workbench.save_filters(operator=None, status=None)
+        click.echo(click.style("[OK] 已清除所有筛选条件", fg="green"))
+        return
+
+    if operator is None and status is None:
+        filters = workbench.get_filters()
+        if filters:
+            click.echo("=== 当前筛选条件 ===")
+            if filters.get("operator"):
+                click.echo(f"  处理人: {filters['operator']}")
+            if filters.get("status"):
+                click.echo(f"  状态: {STATUS_LABELS.get(filters['status'], filters['status'])}")
+            if not filters:
+                click.echo("  无筛选条件")
+        else:
+            click.echo("暂无筛选条件")
+        return
+
+    workbench.save_filters(operator=operator, status=status)
+
+    parts = []
+    if operator:
+        parts.append(f"处理人: {operator}")
+    if status:
+        parts.append(f"状态: {STATUS_LABELS.get(status, status)}")
+
+    click.echo(click.style(f"[OK] 筛选条件已设置: {', '.join(parts)}", fg="green"))
+    click.echo("程序重启后将自动恢复这些筛选条件")
+
+
+@batch.command("reminders")
+@click.option("--batch-id", type=int, default=None, help="指定批次ID，默认所有批次")
+@click.pass_context
+def batch_reminders(ctx, batch_id):
+    """未完成项提醒"""
+    workbench = ctx.obj["workbench"]
+
+    result = workbench.get_unfinished_reminder(batch_id=batch_id)
+
+    if not result["success"]:
+        click.echo(click.style(result["message"], fg="yellow"))
+        return
+
+    if result["total_unfinished"] == 0:
+        click.echo(click.style("[OK] 所有批次处理完成，暂无待办事项", fg="green"))
+        return
+
+    click.echo(click.style(f"⚠ 共有 {result['total_unfinished']} 个待处理项，涉及 {result['batch_count']} 个批次", fg="yellow", bold=True))
+    click.echo()
+
+    for reminder in result["reminders"]:
+        click.echo(click.style(f"━━━ 批次 #{reminder['batch_id']}: {reminder['file_name']} ━━━", fg="white"))
+        click.echo(f"  进度: {reminder['progress_percent']:.1f}%")
+        for item in reminder["unfinished_items"]:
+            click.echo(f"  • {item}")
+        click.echo()
+
+
+@batch.command("export-progress")
+@click.argument("batch_id", type=int)
+@click.option("--operator", default=None, help="当前操作者")
+@click.option("--format", "export_format", type=click.Choice(["xlsx", "csv", "json"]),
+              default=None, help="导出格式")
+@click.pass_context
+def batch_export_progress(ctx, batch_id, operator, export_format):
+    """一键导出当前批次进度（含冲突和差异）"""
+    exporter = ctx.obj["exporter"]
+    operator = operator or get_current_user()
+
+    click.echo(f"正在导出批次 #{batch_id} 进度...")
+    result = exporter.export_batch_progress(batch_id, operator, format=export_format)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 批次进度已导出: {result['file_path']}", fg="green"))
+    click.echo(f"格式: {result['format']}")
+    click.echo(f"生成时间: {result['generated_at']}")
+    click.echo()
+    click.echo("报告摘要:")
+    summary = result["summary"]
+    click.echo(f"  总匹配数: {summary['total_matches']}")
+    click.echo(f"  待确认: {summary['pending_count']}")
+    click.echo(f"  已确认: {summary['confirmed_count']}")
+    click.echo(f"  异常: {summary['exception_count']}")
+    click.echo(f"  已撤销: {summary['revoked_count']}")
+    click.echo(f"  冲突数: {summary['conflict_count']}")
+
+
+@batch.command("conflicts")
+@click.option("--batch-id", type=int, default=None, help="指定批次ID")
+@click.option("--conflict-type", default=None,
+              type=click.Choice(["new_record", "status_change", "duplicate_process", "amount_change"]),
+              help="按冲突类型过滤")
+@click.pass_context
+def batch_conflicts(ctx, batch_id, conflict_type):
+    """查看批次冲突明细"""
+    db = ctx.obj["db"]
+
+    conflicts = db.get_batch_conflicts(batch_id=batch_id, conflict_type=conflict_type)
+
+    if not conflicts:
+        click.echo(click.style("[OK] 未检测到冲突", fg="green"))
+        return
+
+    click.echo(click.style(f"[!!] 检测到 {len(conflicts)} 个冲突", fg="red", bold=True))
+    click.echo()
+
+    headers = ["ID", "批次ID", "文件", "冲突类型", "记录类型", "记录编号", "冲突原因", "检测时间"]
+    rows = []
+    for c in conflicts:
+        rows.append([
+            c["id"],
+            c["batch_id"],
+            c["file_name"],
+            CONFLICT_TYPE_LABELS.get(c["conflict_type"], c["conflict_type"]),
+            "发票" if c["record_type"] == "invoice" else "收款",
+            c["record_no"],
+            (c["conflict_reason"] or "")[:50],
+            c["detected_at"],
+        ])
+    print_table(headers, rows)
+
+    click.echo()
+    click.echo("冲突说明:")
+    click.echo("  • 新增记录: 本次导入新增的记录，之前批次中不存在")
+    click.echo("  • 状态冲突: 同一记录在不同批次中的状态不一致")
+    click.echo("  • 重复处理: 同一记录被不同操作者处理")
+    click.echo("  • 金额变更: 同一记录在不同批次中的金额不一致")
+
+
+@batch.command("restore")
+@click.pass_context
+def batch_restore(ctx):
+    """手动恢复上次会话状态"""
+    workbench = ctx.obj["workbench"]
+
+    result = workbench.restore_workbench_state()
+
+    if not result["restored"]:
+        click.echo(click.style("没有可恢复的会话状态", fg="yellow"))
+        return
+
+    click.echo(click.style("[OK] 已恢复上次会话状态", fg="green"))
+    if result["last_batch"]:
+        lb = result["last_batch"]
+        click.echo(f"  批次: #{lb['batch_id']} - {lb['file_name']} ({lb['file_type']})")
+        if lb.get("selected_at"):
+            click.echo(f"  选择时间: {lb['selected_at']}")
+    if result["filters"]:
+        filters = result["filters"]
+        parts = []
+        if filters.get("operator"):
+            parts.append(f"处理人: {filters['operator']}")
+        if filters.get("status"):
+            parts.append(f"状态: {STATUS_LABELS.get(filters['status'], filters['status'])}")
+        if parts:
+            click.echo(f"  筛选: {', '.join(parts)}")
+    if result["last_access_time"]:
+        click.echo(f"  上次访问: {result['last_access_time']}")
+
+
+@batch.command("clear-state")
+@click.pass_context
+def batch_clear_state(ctx):
+    """清除会话状态（不恢复上次批次和筛选条件）"""
+    workbench = ctx.obj["workbench"]
+    workbench.clear_workbench_state()
+    click.echo(click.style("[OK] 已清除会话状态，下次启动将不会恢复", fg="green"))
+
+
+@batch.command("list")
+@click.option("--all", "show_all", is_flag=True, help="显示所有批次（含已处理完成）")
+@click.pass_context
+def batch_list(ctx, show_all):
+    """列出所有批次"""
+    workbench = ctx.obj["workbench"]
+
+    result = workbench.get_batch_workbench_summary()
+
+    if not result["success"]:
+        click.echo(click.style(result["message"], fg="yellow"))
+        return
+
+    batches = result["batches"]
+    if not show_all:
+        batches = [b for b in batches if b["has_unfinished"]]
+
+    if not batches:
+        click.echo("暂无批次" if show_all else "所有批次已处理完成")
+        return
+
+    headers = ["ID", "类型", "文件名", "操作人", "进度", "待办", "冲突", "导入时间"]
+    rows = []
+    for b in batches:
+        todo_count = b["pending_matches"] + b["unmatched_invoices"] + b["unmatched_payments"] + b["conflict_count"]
+        rows.append([
+            b["batch_id"],
+            b["file_type"],
+            b["file_name"],
+            b["operator"],
+            f"{b['progress_percent']:.1f}%",
+            todo_count if b["has_unfinished"] else "-",
+            b["conflict_count"] if b["conflict_count"] > 0 else "-",
+            b["imported_at"],
+        ])
+    print_table(headers, rows)
 
 
 if __name__ == "__main__":

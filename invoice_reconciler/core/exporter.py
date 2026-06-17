@@ -20,6 +20,13 @@ from .matcher import (
     MATCH_TYPE_MANUAL,
 )
 
+CONFLICT_TYPE_LABELS = {
+    "new_record": "新增记录",
+    "status_change": "状态冲突",
+    "duplicate_process": "重复处理",
+    "amount_change": "金额变更",
+}
+
 
 STATUS_LABELS = {
     MATCH_STATUS_MATCHED: "已匹配",
@@ -344,6 +351,28 @@ class ReportExporter:
             })
         return result
 
+    def _generate_conflicts_data(self, batch_id: int = None) -> List[Dict]:
+        conflicts = self.db.get_batch_conflicts(batch_id=batch_id)
+        result = []
+        for c in conflicts:
+            result.append({
+                "冲突ID": c["id"],
+                "批次ID": c["batch_id"],
+                "来源文件": c["file_name"],
+                "冲突类型": CONFLICT_TYPE_LABELS.get(c["conflict_type"], c["conflict_type"]),
+                "记录类型": "发票" if c["record_type"] == "invoice" else "收款",
+                "记录编号": c["record_no"],
+                "原状态": STATUS_LABELS.get(c["old_status"], c["old_status"]) if c["old_status"] else "-",
+                "新状态": STATUS_LABELS.get(c["new_status"], c["new_status"]) if c["new_status"] else "-",
+                "原操作人": c["old_operator"] or "-",
+                "新操作人": c["new_operator"] or "-",
+                "原金额": f"{c['old_amount']:.2f}" if c["old_amount"] is not None else "-",
+                "新金额": f"{c['new_amount']:.2f}" if c["new_amount"] is not None else "-",
+                "冲突原因": c["conflict_reason"],
+                "检测时间": c["detected_at"],
+            })
+        return result
+
     def _export_xlsx(self, base_name: str, sheets_data: Dict[str, List[Dict]]) -> str:
         file_path = os.path.join(self.config.export_dir, f"{base_name}.xlsx")
 
@@ -409,6 +438,7 @@ class ReportExporter:
         revoked_data = self._generate_revoked_data()
         errors_data = self._generate_errors_data()
         history_data = self._generate_history_data()
+        conflicts_data = self._generate_conflicts_data()
 
         export_data = {
             "概览": summary,
@@ -420,6 +450,7 @@ class ReportExporter:
             "已撤销": revoked_data,
             "导入错误": errors_data,
             "状态历史": history_data,
+            "批次冲突": conflicts_data,
         }
 
         if export_format == "xlsx":
@@ -445,7 +476,112 @@ class ReportExporter:
                 "unmatched_payments_count": len(unmatched_payments_data),
                 "revoked_count": len(revoked_data),
                 "errors_count": len(errors_data),
+                "conflicts_count": len(conflicts_data),
             }
+        }
+
+    def export_batch_progress(self, batch_id: int, operator: str = None, format: str = None) -> Dict:
+        from .batch_workbench import BatchWorkbench
+        workbench = BatchWorkbench(self.config, self.db)
+
+        export_format = format or self.config.export_format
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"batch_progress_{batch_id}_{timestamp}"
+
+        progress_result = workbench.export_batch_progress(batch_id, operator)
+        if not progress_result["success"]:
+            return progress_result
+
+        data = progress_result["data"]
+        batch_info = data["batch_info"]
+        progress = data["progress"]
+        raw_matches = data["matches"]
+        raw_conflicts = data["conflicts"]
+
+        matches = []
+        for m in raw_matches:
+            matches.append({
+                "匹配ID": m.get("match_id", ""),
+                "匹配编号": m.get("match_no", ""),
+                "匹配类型": m.get("match_type", ""),
+                "状态": m.get("match_status", ""),
+                "发票号": m.get("invoice_no", ""),
+                "发票金额": f"{m.get('invoice_amount', 0):.2f}" if m.get("invoice_amount") is not None else "-",
+                "收款号": m.get("payment_no", ""),
+                "收款金额": f"{m.get('payment_amount', 0):.2f}" if m.get("payment_amount") is not None else "-",
+                "匹配方式": m.get("match_evidence", ""),
+                "处理人": m.get("operator", ""),
+                "操作时间": m.get("confirmed_at", "") or m.get("created_at", ""),
+            })
+
+        conflicts = []
+        for c in raw_conflicts:
+            conflicts.append({
+                "冲突ID": c.get("conflict_id", ""),
+                "批次ID": batch_id,
+                "来源文件": batch_info.get("file_name", ""),
+                "冲突类型": c.get("conflict_type", ""),
+                "记录类型": c.get("record_type", ""),
+                "记录编号": c.get("record_no", ""),
+                "原状态": c.get("old_status", "-"),
+                "新状态": c.get("new_status", "-"),
+                "原操作人": c.get("old_operator", "-"),
+                "新操作人": c.get("new_operator", "-"),
+                "原金额": f"{c['old_amount']:.2f}" if c.get("old_amount") is not None else "-",
+                "新金额": f"{c['new_amount']:.2f}" if c.get("new_amount") is not None else "-",
+                "冲突原因": c.get("conflict_reason", ""),
+                "检测时间": c.get("detected_at", ""),
+            })
+
+        batch_summary = [
+            {"项目": "批次ID", "值": batch_info["batch_id"], "备注": ""},
+            {"项目": "文件类型", "值": batch_info["file_type"], "备注": ""},
+            {"项目": "文件名", "值": batch_info["file_name"], "备注": ""},
+            {"项目": "导入操作人", "值": batch_info["operator"], "备注": ""},
+            {"项目": "导入时间", "值": batch_info["imported_at"], "备注": ""},
+            {"项目": "总行数", "值": batch_info["total_rows"], "备注": ""},
+            {"项目": "成功行数", "值": batch_info["success_rows"], "备注": ""},
+            {"项目": "失败行数", "值": batch_info["failed_rows"], "备注": ""},
+            {"项目": "进度百分比", "值": f"{progress['progress_percent']:.2f}%", "备注": ""},
+            {"项目": "待确认匹配", "值": progress["pending_matches"], "备注": ""},
+            {"项目": "已确认匹配", "值": progress["confirmed_matches"], "备注": ""},
+            {"项目": "异常匹配", "值": progress["exception_matches"], "备注": ""},
+            {"项目": "已撤销匹配", "值": progress["revoked_matches"], "备注": ""},
+            {"项目": "未匹配发票", "值": progress["unmatched_invoices"], "备注": ""},
+            {"项目": "未匹配收款", "值": progress["unmatched_payments"], "备注": ""},
+            {"项目": "冲突数量", "值": progress["conflict_count"], "备注": ""},
+            {"项目": "导出时间", "值": progress["exported_at"], "备注": ""},
+            {"项目": "导出人", "值": progress["exported_by"], "备注": ""},
+        ]
+
+        export_data = {
+            "批次摘要": batch_summary,
+            "匹配明细": matches,
+            "批次冲突": conflicts,
+        }
+
+        if export_format == "xlsx":
+            file_path = self._export_xlsx(base_name, export_data)
+        elif export_format == "csv":
+            file_path = self._export_csv(base_name, export_data)
+        elif export_format == "json":
+            file_path = self._export_json(base_name, {
+                "batch_info": batch_info,
+                "progress": progress,
+                "matches": matches,
+                "conflicts": conflicts,
+            })
+        else:
+            raise ValueError(f"不支持的导出格式: {export_format}")
+
+        return {
+            "success": True,
+            "file_path": file_path,
+            "format": export_format,
+            "generated_at": datetime.now().isoformat(),
+            "operator": operator,
+            "batch_id": batch_id,
+            "summary": progress_result["summary"],
         }
 
     def export_diff_report(self, operator: str = None, format: str = None) -> Dict:
