@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import json
 import hashlib
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
@@ -162,6 +163,59 @@ class Database:
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_errors_batch ON errors(batch_id);
+
+                CREATE TABLE IF NOT EXISTS review_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_no TEXT UNIQUE NOT NULL,
+                    snapshot_type TEXT NOT NULL,
+                    description TEXT,
+                    operator TEXT,
+                    total_matches INTEGER DEFAULT 0,
+                    matched_count INTEGER DEFAULT 0,
+                    pending_count INTEGER DEFAULT 0,
+                    exception_count INTEGER DEFAULT 0,
+                    revoked_count INTEGER DEFAULT 0,
+                    total_invoice_amount REAL DEFAULT 0,
+                    total_payment_amount REAL DEFAULT 0,
+                    matched_amount REAL DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshots_no ON review_snapshots(snapshot_no);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_created ON review_snapshots(created_at);
+
+                CREATE TABLE IF NOT EXISTS snapshot_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    snapshot_id INTEGER NOT NULL,
+                    match_id INTEGER,
+                    match_no TEXT,
+                    match_type TEXT,
+                    match_score REAL,
+                    match_evidence TEXT,
+                    status TEXT,
+                    invoice_id INTEGER,
+                    invoice_no TEXT,
+                    invoice_date TEXT,
+                    inv_customer TEXT,
+                    inv_amount REAL,
+                    inv_batch_id INTEGER,
+                    payment_id INTEGER,
+                    payment_no TEXT,
+                    payment_date TEXT,
+                    pay_customer TEXT,
+                    pay_amount REAL,
+                    pay_batch_id INTEGER,
+                    operator TEXT,
+                    operator_remark TEXT,
+                    confirmed_at TEXT,
+                    created_at TEXT,
+                    status_history TEXT,
+                    candidate_payments TEXT,
+                    FOREIGN KEY (snapshot_id) REFERENCES review_snapshots(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot ON snapshot_items(snapshot_id);
+                CREATE INDEX IF NOT EXISTS idx_snapshot_items_match ON snapshot_items(match_no);
             """)
 
     @staticmethod
@@ -599,3 +653,177 @@ class Database:
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (match_id, invoice_id, payment_id, old_status, new_status, operator, remark)
         )
+
+    def create_review_snapshot(self, snapshot_type: str, description: str = None,
+                               operator: str = None) -> Dict:
+        snapshot_no = self._generate_snapshot_no()
+        matches = self.get_matches_by_status()
+
+        matched_count = sum(1 for m in matches if m["status"] == MATCH_STATUS_MATCHED)
+        pending_count = sum(1 for m in matches if m["status"] == MATCH_STATUS_PENDING)
+        exception_count = sum(1 for m in matches if m["status"] == MATCH_STATUS_EXCEPTION)
+        revoked_count = sum(1 for m in matches if m["status"] == MATCH_STATUS_REVOKED)
+
+        matched_amount = sum(m["inv_amount"] for m in matches if m["status"] == MATCH_STATUS_MATCHED)
+
+        stats = self.get_statistics()
+        total_inv_amt = self._get_total_invoice_amount()
+        total_pay_amt = self._get_total_payment_amount()
+
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO review_snapshots
+                   (snapshot_no, snapshot_type, description, operator,
+                    total_matches, matched_count, pending_count,
+                    exception_count, revoked_count,
+                    total_invoice_amount, total_payment_amount, matched_amount)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (snapshot_no, snapshot_type, description, operator,
+                 len(matches), matched_count, pending_count,
+                 exception_count, revoked_count,
+                 total_inv_amt, total_pay_amt, matched_amount)
+            )
+            snapshot_id = cursor.lastrowid
+
+            for m in matches:
+                history = self.get_status_history(match_id=m["id"])
+                history_json = json.dumps(history, ensure_ascii=False) if history else "[]"
+
+                candidates = self.get_match_candidates(invoice_id=m["invoice_id"])
+                candidates_json = json.dumps(candidates, ensure_ascii=False) if candidates else "[]"
+
+                conn.execute(
+                    """INSERT INTO snapshot_items
+                       (snapshot_id, match_id, match_no, match_type, match_score,
+                        match_evidence, status, invoice_id, invoice_no, invoice_date,
+                        inv_customer, inv_amount, inv_batch_id,
+                        payment_id, payment_no, payment_date, pay_customer,
+                        pay_amount, pay_batch_id, operator, operator_remark,
+                        confirmed_at, created_at, status_history, candidate_payments)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (snapshot_id, m["id"], m["match_no"], m["match_type"], m["match_score"],
+                     m["match_evidence"], m["status"], m["invoice_id"], m["invoice_no"],
+                     m["invoice_date"], m["inv_customer"], m["inv_amount"], m.get("batch_id"),
+                     m["payment_id"], m["payment_no"], m["payment_date"], m["pay_customer"],
+                     m["pay_amount"], None, m["operator"], m["operator_remark"],
+                     m["confirmed_at"], m["created_at"], history_json, candidates_json)
+                )
+
+        return self.get_snapshot_by_no(snapshot_no)
+
+    def _generate_snapshot_no(self) -> str:
+        now = datetime.now()
+        prefix = f"R{now.strftime('%Y%m%d')}"
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM review_snapshots WHERE snapshot_no LIKE ?",
+                (prefix + "%",)
+            ).fetchone()
+            seq = row[0] + 1
+            return f"{prefix}{seq:04d}"
+
+    def _get_total_invoice_amount(self) -> float:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'normal'"
+            ).fetchone()
+            return row[0]
+
+    def _get_total_payment_amount(self) -> float:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'normal'"
+            ).fetchone()
+            return row[0]
+
+    def get_snapshot_by_no(self, snapshot_no: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_snapshots WHERE snapshot_no = ?",
+                (snapshot_no,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_snapshot_by_id(self, snapshot_id: int) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_snapshots WHERE id = ?",
+                (snapshot_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_snapshots(self, limit: int = 50) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM review_snapshots ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_snapshot_items(self, snapshot_id: int) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM snapshot_items WHERE snapshot_id = ? ORDER BY id",
+                (snapshot_id,)
+            ).fetchall()
+            items = [dict(r) for r in rows]
+            for item in items:
+                if item.get("status_history"):
+                    try:
+                        item["status_history"] = json.loads(item["status_history"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["status_history"] = []
+                if item.get("candidate_payments"):
+                    try:
+                        item["candidate_payments"] = json.loads(item["candidate_payments"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["candidate_payments"] = []
+            return items
+
+    def check_invoice_conflicts(self, invoice_no: str = None) -> List[Dict]:
+        with self._get_conn() as conn:
+            if invoice_no:
+                rows = conn.execute(
+                    """SELECT m.*, i.invoice_no, i.invoice_date, i.customer as inv_customer,
+                              i.amount as inv_amount
+                       FROM matches m
+                       JOIN invoices i ON m.invoice_id = i.id
+                       WHERE i.invoice_no = ?
+                       ORDER BY m.created_at""",
+                    (invoice_no,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT m.*, i.invoice_no, i.invoice_date, i.customer as inv_customer,
+                              i.amount as inv_amount
+                       FROM matches m
+                       JOIN invoices i ON m.invoice_id = i.id
+                       ORDER BY i.invoice_no, m.created_at""",
+                ).fetchall()
+
+            invoice_matches = {}
+            for r in rows:
+                inv_no = r["invoice_no"]
+                if inv_no not in invoice_matches:
+                    invoice_matches[inv_no] = []
+                invoice_matches[inv_no].append(dict(r))
+
+            conflicts = []
+            for inv_no, matches in invoice_matches.items():
+                operators = set()
+                active_count = 0
+                for m in matches:
+                    if m["operator"]:
+                        operators.add(m["operator"])
+                    if m["status"] != MATCH_STATUS_REVOKED:
+                        active_count += 1
+                if len(matches) > 1 and len(operators) > 1:
+                    conflicts.append({
+                        "invoice_no": inv_no,
+                        "match_count": len(matches),
+                        "active_count": active_count,
+                        "operators": list(operators),
+                        "matches": matches
+                    })
+            return conflicts

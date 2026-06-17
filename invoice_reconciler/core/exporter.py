@@ -1,4 +1,5 @@
 import os
+import json
 import csv
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -41,131 +42,6 @@ class ReportExporter:
         self.config = config
         self.db = db
         os.makedirs(config.export_dir, exist_ok=True)
-
-    def export_full_report(self, operator: str = None) -> Dict:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = f"reconciliation_report_{timestamp}"
-
-        summary = self._generate_summary()
-        matched_data = self._generate_matched_data()
-        pending_data = self._generate_pending_data()
-        exception_data = self._generate_exception_data()
-        unmatched_invoices_data = self._generate_unmatched_invoices()
-        unmatched_payments_data = self._generate_unmatched_payments()
-        revoked_data = self._generate_revoked_data()
-        errors_data = self._generate_errors_data()
-        history_data = self._generate_history_data()
-
-        export_data = {
-            "概览": summary,
-            "已匹配": matched_data,
-            "待确认": pending_data,
-            "异常": exception_data,
-            "未匹配发票": unmatched_invoices_data,
-            "未匹配收款": unmatched_payments_data,
-            "已撤销": revoked_data,
-            "导入错误": errors_data,
-            "状态历史": history_data,
-        }
-
-        if self.config.export_format == "xlsx":
-            file_path = self._export_xlsx(base_name, export_data)
-        else:
-            file_path = self._export_csv(base_name, export_data)
-
-        return {
-            "success": True,
-            "file_path": file_path,
-            "format": self.config.export_format,
-            "generated_at": datetime.now().isoformat(),
-            "operator": operator,
-            "summary": {
-                "matched_count": len(matched_data),
-                "pending_count": len(pending_data),
-                "exception_count": len(exception_data),
-                "unmatched_invoices_count": len(unmatched_invoices_data),
-                "unmatched_payments_count": len(unmatched_payments_data),
-                "revoked_count": len(revoked_data),
-                "errors_count": len(errors_data),
-            }
-        }
-
-    def export_diff_report(self, operator: str = None) -> Dict:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = f"diff_report_{timestamp}"
-
-        summary = self._generate_summary()
-        unmatched_invoices_data = self._generate_unmatched_invoices()
-        unmatched_payments_data = self._generate_unmatched_payments()
-        exception_data = self._generate_exception_data()
-        errors_data = self._generate_errors_data()
-
-        inv_amount = sum(r["发票金额"] for r in unmatched_invoices_data)
-        pay_amount = sum(r["收款金额"] for r in unmatched_payments_data)
-        diff_amount = inv_amount - pay_amount
-
-        diff_summary = [
-            {
-                "项目": "未匹配发票数量",
-                "值": len(unmatched_invoices_data),
-                "备注": ""
-            },
-            {
-                "项目": "未匹配收款数量",
-                "值": len(unmatched_payments_data),
-                "备注": ""
-            },
-            {
-                "项目": "未匹配发票总金额",
-                "值": inv_amount,
-                "备注": ""
-            },
-            {
-                "项目": "未匹配收款总金额",
-                "值": pay_amount,
-                "备注": ""
-            },
-            {
-                "项目": "差异金额",
-                "值": diff_amount,
-                "备注": "正数表示发票多，负数表示收款多"
-            },
-            {
-                "项目": "异常匹配数量",
-                "值": len(exception_data),
-                "备注": ""
-            },
-            {
-                "项目": "导入错误数量",
-                "值": len(errors_data),
-                "备注": ""
-            },
-        ]
-
-        export_data = {
-            "差异概览": diff_summary,
-            "统计概览": summary,
-            "未匹配发票": unmatched_invoices_data,
-            "未匹配收款": unmatched_payments_data,
-            "异常匹配": exception_data,
-            "导入错误": errors_data,
-        }
-
-        if self.config.export_format == "xlsx":
-            file_path = self._export_xlsx(base_name, export_data)
-        else:
-            file_path = self._export_csv(base_name, export_data)
-
-        return {
-            "success": True,
-            "file_path": file_path,
-            "format": self.config.export_format,
-            "generated_at": datetime.now().isoformat(),
-            "operator": operator,
-            "diff_amount": diff_amount,
-            "unmatched_invoice_amount": inv_amount,
-            "unmatched_payment_amount": pay_amount,
-        }
 
     def _generate_summary(self) -> List[Dict]:
         stats = self.db.get_statistics()
@@ -430,3 +306,180 @@ class ReportExporter:
                     f.write("提示\n无数据\n")
 
         return dir_path
+
+    def _export_json(self, base_name: str, data: Dict) -> str:
+        file_path = os.path.join(self.config.export_dir, f"{base_name}.json")
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+        return file_path
+
+    def export_full_report(self, operator: str = None, format: str = None) -> Dict:
+        export_format = format or self.config.export_format
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"reconciliation_report_{timestamp}"
+
+        summary = self._generate_summary()
+        matched_data = self._generate_matched_data()
+        pending_data = self._generate_pending_data()
+        exception_data = self._generate_exception_data()
+        unmatched_invoices_data = self._generate_unmatched_invoices()
+        unmatched_payments_data = self._generate_unmatched_payments()
+        revoked_data = self._generate_revoked_data()
+        errors_data = self._generate_errors_data()
+        history_data = self._generate_history_data()
+
+        export_data = {
+            "概览": summary,
+            "已匹配": matched_data,
+            "待确认": pending_data,
+            "异常": exception_data,
+            "未匹配发票": unmatched_invoices_data,
+            "未匹配收款": unmatched_payments_data,
+            "已撤销": revoked_data,
+            "导入错误": errors_data,
+            "状态历史": history_data,
+        }
+
+        if export_format == "xlsx":
+            file_path = self._export_xlsx(base_name, export_data)
+        elif export_format == "csv":
+            file_path = self._export_csv(base_name, export_data)
+        elif export_format == "json":
+            file_path = self._export_json(base_name, export_data)
+        else:
+            raise ValueError(f"不支持的导出格式: {export_format}")
+
+        return {
+            "success": True,
+            "file_path": file_path,
+            "format": export_format,
+            "generated_at": datetime.now().isoformat(),
+            "operator": operator,
+            "summary": {
+                "matched_count": len(matched_data),
+                "pending_count": len(pending_data),
+                "exception_count": len(exception_data),
+                "unmatched_invoices_count": len(unmatched_invoices_data),
+                "unmatched_payments_count": len(unmatched_payments_data),
+                "revoked_count": len(revoked_data),
+                "errors_count": len(errors_data),
+            }
+        }
+
+    def export_diff_report(self, operator: str = None, format: str = None) -> Dict:
+        export_format = format or self.config.export_format
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"diff_report_{timestamp}"
+
+        summary = self._generate_summary()
+        unmatched_invoices_data = self._generate_unmatched_invoices()
+        unmatched_payments_data = self._generate_unmatched_payments()
+        exception_data = self._generate_exception_data()
+        errors_data = self._generate_errors_data()
+
+        inv_amount = sum(r["发票金额"] for r in unmatched_invoices_data)
+        pay_amount = sum(r["收款金额"] for r in unmatched_payments_data)
+        diff_amount = inv_amount - pay_amount
+
+        diff_summary = [
+            {
+                "项目": "未匹配发票数量",
+                "值": len(unmatched_invoices_data),
+                "备注": ""
+            },
+            {
+                "项目": "未匹配收款数量",
+                "值": len(unmatched_payments_data),
+                "备注": ""
+            },
+            {
+                "项目": "未匹配发票总金额",
+                "值": inv_amount,
+                "备注": ""
+            },
+            {
+                "项目": "未匹配收款总金额",
+                "值": pay_amount,
+                "备注": ""
+            },
+            {
+                "项目": "差异金额",
+                "值": diff_amount,
+                "备注": "正数表示发票多，负数表示收款多"
+            },
+            {
+                "项目": "异常匹配数量",
+                "值": len(exception_data),
+                "备注": ""
+            },
+            {
+                "项目": "导入错误数量",
+                "值": len(errors_data),
+                "备注": ""
+            },
+        ]
+
+        export_data = {
+            "差异概览": diff_summary,
+            "统计概览": summary,
+            "未匹配发票": unmatched_invoices_data,
+            "未匹配收款": unmatched_payments_data,
+            "异常匹配": exception_data,
+            "导入错误": errors_data,
+        }
+
+        if export_format == "xlsx":
+            file_path = self._export_xlsx(base_name, export_data)
+        elif export_format == "csv":
+            file_path = self._export_csv(base_name, export_data)
+        elif export_format == "json":
+            file_path = self._export_json(base_name, export_data)
+        else:
+            raise ValueError(f"不支持的导出格式: {export_format}")
+
+        return {
+            "success": True,
+            "file_path": file_path,
+            "format": export_format,
+            "generated_at": datetime.now().isoformat(),
+            "operator": operator,
+            "diff_amount": diff_amount,
+            "unmatched_invoice_amount": inv_amount,
+            "unmatched_payment_amount": pay_amount,
+        }
+
+    def export_snapshot(self, snapshot_data: Dict, operator: str = None,
+                        format: str = None) -> Dict:
+        export_format = format or self.config.export_format
+        snapshot_info = snapshot_data["snapshot_info"]
+        items = snapshot_data["items"]
+        snapshot_no = snapshot_info["快照编号"]
+
+        base_name = f"snapshot_{snapshot_no}"
+
+        export_data = {
+            "快照信息": [snapshot_info],
+            "匹配明细": items,
+        }
+
+        if export_format == "xlsx":
+            file_path = self._export_xlsx(base_name, export_data)
+        elif export_format == "csv":
+            file_path = self._export_csv(base_name, export_data)
+        elif export_format == "json":
+            file_path = self._export_json(base_name, {
+                "snapshot_info": snapshot_info,
+                "items": items,
+            })
+        else:
+            raise ValueError(f"不支持的导出格式: {export_format}")
+
+        return {
+            "success": True,
+            "snapshot_no": snapshot_no,
+            "file_path": file_path,
+            "format": export_format,
+            "generated_at": datetime.now().isoformat(),
+            "operator": operator,
+            "item_count": len(items),
+        }

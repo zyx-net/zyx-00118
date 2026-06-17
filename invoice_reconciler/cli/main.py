@@ -16,6 +16,11 @@ from invoice_reconciler.core.importer import CSVImporter
 from invoice_reconciler.core.matcher import MatchEngine
 from invoice_reconciler.core.revoker import Revoker
 from invoice_reconciler.core.exporter import ReportExporter, STATUS_LABELS, MATCH_TYPE_LABELS
+from invoice_reconciler.core.reviewer import (
+    ReviewSnapshot,
+    SNAPSHOT_TYPE_LABELS,
+    SNAPSHOT_TYPE_MANUAL,
+)
 
 
 def get_current_user() -> str:
@@ -61,6 +66,7 @@ def cli(ctx, config_path):
             "matcher": MatchEngine(config, db),
             "revoker": Revoker(db),
             "exporter": ReportExporter(config, db),
+            "reviewer": ReviewSnapshot(db),
         }
     except Exception as e:
         click.echo(f"初始化失败: {e}", err=True)
@@ -578,14 +584,16 @@ def export():
 
 @export.command("full")
 @click.option("--operator", default=None, help="操作者")
+@click.option("--format", "export_format", type=click.Choice(["xlsx", "csv", "json"]),
+              default=None, help="导出格式，默认使用配置文件中的设置")
 @click.pass_context
-def export_full(ctx, operator):
+def export_full(ctx, operator, export_format):
     """导出完整报告"""
     exporter = ctx.obj["exporter"]
     operator = operator or get_current_user()
 
     click.echo("正在生成完整报告...")
-    result = exporter.export_full_report(operator)
+    result = exporter.export_full_report(operator, format=export_format)
 
     click.echo(click.style(f"✓ 报告已生成: {result['file_path']}", fg="green"))
     click.echo(f"格式: {result['format']}")
@@ -597,14 +605,16 @@ def export_full(ctx, operator):
 
 @export.command("diff")
 @click.option("--operator", default=None, help="操作者")
+@click.option("--format", "export_format", type=click.Choice(["xlsx", "csv", "json"]),
+              default=None, help="导出格式，默认使用配置文件中的设置")
 @click.pass_context
-def export_diff(ctx, operator):
+def export_diff(ctx, operator, export_format):
     """导出差异报告"""
     exporter = ctx.obj["exporter"]
     operator = operator or get_current_user()
 
     click.echo("正在生成差异报告...")
-    result = exporter.export_diff_report(operator)
+    result = exporter.export_diff_report(operator, format=export_format)
 
     click.echo(click.style(f"✓ 差异报告已生成: {result['file_path']}", fg="green"))
     click.echo(f"格式: {result['format']}")
@@ -615,6 +625,40 @@ def export_diff(ctx, operator):
         f"  差异金额: {result['diff_amount']:.2f}",
         fg="red" if abs(result['diff_amount']) > 0 else "green"
     ))
+
+
+@export.command("snapshot")
+@click.option("--snapshot-no", default=None, help="快照编号")
+@click.option("--snapshot-id", type=int, default=None, help="快照ID")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--format", "export_format", type=click.Choice(["xlsx", "csv", "json"]),
+              default=None, help="导出格式，默认使用配置文件中的设置")
+@click.pass_context
+def export_snapshot(ctx, snapshot_no, snapshot_id, operator, export_format):
+    """导出复核快照"""
+    if not snapshot_no and not snapshot_id:
+        click.echo(click.style("请指定 --snapshot-no 或 --snapshot-id", fg="red"), err=True)
+        sys.exit(1)
+
+    reviewer = ctx.obj["reviewer"]
+    exporter = ctx.obj["exporter"]
+    operator = operator or get_current_user()
+
+    try:
+        snapshot_data = reviewer.get_snapshot_for_export(
+            snapshot_no=snapshot_no, snapshot_id=snapshot_id
+        )
+    except ValueError as e:
+        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo("正在导出快照...")
+    result = exporter.export_snapshot(snapshot_data, operator, format=export_format)
+
+    click.echo(click.style(f"✓ 快照已导出: {result['file_path']}", fg="green"))
+    click.echo(f"快照编号: {result['snapshot_no']}")
+    click.echo(f"格式: {result['format']}")
+    click.echo(f"记录数: {result['item_count']}")
 
 
 @cli.command("status")
@@ -761,6 +805,229 @@ def list_unmatched(ctx, list_type):
             print_table(headers, rows)
         else:
             click.echo("无未匹配收款")
+
+
+@cli.group()
+def review():
+    """复核快照与回放校验"""
+    pass
+
+
+@review.group("snapshot")
+def review_snapshot():
+    """复核快照管理"""
+    pass
+
+
+@review_snapshot.command("create")
+@click.option("--description", default=None, help="快照描述")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def snapshot_create(ctx, description, operator):
+    """创建复核快照"""
+    reviewer = ctx.obj["reviewer"]
+    operator = operator or get_current_user()
+
+    click.echo("正在生成复核快照...")
+    snapshot = reviewer.create_snapshot(
+        snapshot_type=SNAPSHOT_TYPE_MANUAL,
+        description=description,
+        operator=operator
+    )
+
+    click.echo(click.style(f"✓ 快照已创建", fg="green"))
+    click.echo(f"快照编号: {snapshot['snapshot_no']}")
+    click.echo(f"类型: {SNAPSHOT_TYPE_LABELS.get(snapshot['snapshot_type'], snapshot['snapshot_type'])}")
+    click.echo(f"总匹配数: {snapshot['total_matches']}")
+    click.echo(f"已匹配: {snapshot['matched_count']}")
+    click.echo(f"待确认: {snapshot['pending_count']}")
+    click.echo(f"异常: {snapshot['exception_count']}")
+    click.echo(f"已撤销: {snapshot['revoked_count']}")
+    click.echo(f"生成时间: {snapshot['created_at']}")
+
+
+@review_snapshot.command("list")
+@click.option("--limit", type=int, default=50, help="显示数量")
+@click.pass_context
+def snapshot_list(ctx, limit):
+    """列出复核快照"""
+    reviewer = ctx.obj["reviewer"]
+    snapshots = reviewer.list_snapshots(limit)
+
+    if not snapshots:
+        click.echo("暂无快照")
+        return
+
+    headers = ["编号", "类型", "总匹配", "已匹配", "待确认", "异常", "已撤销", "操作者", "生成时间"]
+    rows = []
+    for s in snapshots:
+        rows.append([
+            s["snapshot_no"],
+            s["type_label"],
+            s["total_matches"],
+            s["matched_count"],
+            s["pending_count"],
+            s["exception_count"],
+            s["revoked_count"],
+            s["operator"] or "-",
+            s["created_at"],
+        ])
+    print_table(headers, rows)
+
+
+@review_snapshot.command("show")
+@click.option("--snapshot-no", default=None, help="快照编号")
+@click.option("--snapshot-id", type=int, default=None, help="快照ID")
+@click.pass_context
+def snapshot_show(ctx, snapshot_no, snapshot_id):
+    """显示快照详情"""
+    if not snapshot_no and not snapshot_id:
+        click.echo(click.style("请指定 --snapshot-no 或 --snapshot-id", fg="red"), err=True)
+        sys.exit(1)
+
+    reviewer = ctx.obj["reviewer"]
+    snapshot = reviewer.get_snapshot(snapshot_no=snapshot_no, snapshot_id=snapshot_id)
+
+    if not snapshot:
+        click.echo(click.style("快照不存在", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(f"=== 快照详情 ===")
+    click.echo(f"快照编号: {snapshot['snapshot_no']}")
+    click.echo(f"类型: {snapshot['type_label']}")
+    click.echo(f"描述: {snapshot['description'] or '-'}")
+    click.echo(f"操作者: {snapshot['operator'] or '-'}")
+    click.echo(f"生成时间: {snapshot['created_at']}")
+    click.echo()
+    click.echo(f"总匹配数: {snapshot['total_matches']}")
+    click.echo(f"已匹配: {snapshot['matched_count']}")
+    click.echo(f"待确认: {snapshot['pending_count']}")
+    click.echo(f"异常: {snapshot['exception_count']}")
+    click.echo(f"已撤销: {snapshot['revoked_count']}")
+    click.echo(f"发票总金额: {snapshot['total_invoice_amount']:.2f}")
+    click.echo(f"收款总金额: {snapshot['total_payment_amount']:.2f}")
+    click.echo(f"已匹配金额: {snapshot['matched_amount']:.2f}")
+
+    if snapshot["items"]:
+        click.echo(f"\n=== 匹配明细 ({len(snapshot['items'])} 条) ===")
+        headers = ["匹配编号", "类型", "状态", "发票号", "金额", "收款号", "金额", "操作者"]
+        rows = []
+        for item in snapshot["items"]:
+            rows.append([
+                item["match_no"],
+                MATCH_TYPE_LABELS.get(item["match_type"], item["match_type"]),
+                STATUS_LABELS.get(item["status"], item["status"]),
+                item["invoice_no"],
+                f"{item['inv_amount']:.2f}",
+                item["payment_no"],
+                f"{item['pay_amount']:.2f}",
+                item["operator"] or "-",
+            ])
+        print_table(headers, rows[:20])
+        if len(snapshot["items"]) > 20:
+            click.echo(f"... 还有 {len(snapshot['items']) - 20} 条")
+
+
+@review.command("replay")
+@click.option("--snapshot-no", default=None, help="快照编号")
+@click.option("--snapshot-id", type=int, default=None, help="快照ID")
+@click.pass_context
+def review_replay(ctx, snapshot_no, snapshot_id):
+    """回放校验：对比当前状态与快照"""
+    if not snapshot_no and not snapshot_id:
+        click.echo(click.style("请指定 --snapshot-no 或 --snapshot-id", fg="red"), err=True)
+        sys.exit(1)
+
+    reviewer = ctx.obj["reviewer"]
+
+    try:
+        result = reviewer.replay_verify(snapshot_no=snapshot_no, snapshot_id=snapshot_id)
+    except ValueError as e:
+        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(f"=== 回放校验结果 ===")
+    click.echo(f"快照编号: {result['snapshot_no']}")
+    click.echo(f"快照类型: {result['snapshot_type_label']}")
+    click.echo(f"快照生成时间: {result['snapshot_created_at']}")
+    click.echo()
+    click.echo(f"快照记录数: {result['snapshot_total']}")
+    click.echo(f"当前记录数: {result['current_total']}")
+    click.echo()
+    click.echo(f"一致: {result['matched']}")
+    click.echo(f"状态变更: {result['status_changed']}")
+    click.echo(f"新增: {result['new_in_current']}")
+    click.echo(f"缺失: {result['missing_in_current']}")
+    click.echo()
+
+    if result["is_consistent"]:
+        click.echo(click.style("✓ 校验通过：当前状态与快照完全一致", fg="green"))
+    else:
+        click.echo(click.style(f"✗ 校验未通过：共 {len(result['differences'])} 处差异", fg="red", bold=True))
+
+        if result["differences"]:
+            click.echo("\n=== 差异明细 ===")
+            for diff in result["differences"][:20]:
+                if diff["type"] == "status_changed":
+                    click.echo(
+                        f"  [{diff['match_no']}] 状态变更: "
+                        f"{diff['snapshot_status_label']} -> {diff['current_status_label']} "
+                        f"(发票: {diff['invoice_no']}, 收款: {diff['payment_no']})"
+                    )
+                elif diff["type"] == "new_in_current":
+                    click.echo(
+                        f"  [{diff['match_no']}] 新增记录: "
+                        f"{diff['current_status_label']} "
+                        f"(发票: {diff['invoice_no']}, 收款: {diff['payment_no']}, "
+                        f"操作人: {diff['current_operator'] or '-'})"
+                    )
+                elif diff["type"] == "missing_in_current":
+                    click.echo(
+                        f"  [{diff['match_no']}] 记录缺失: "
+                        f"快照中为 {diff['snapshot_status_label']} "
+                        f"(发票: {diff['invoice_no']}, 收款: {diff['payment_no']}, "
+                        f"操作人: {diff['snapshot_operator'] or '-'})"
+                    )
+
+            if len(result["differences"]) > 20:
+                click.echo(f"... 还有 {len(result['differences']) - 20} 处差异")
+
+
+@review.command("conflicts")
+@click.option("--invoice-no", default=None, help="指定发票号")
+@click.pass_context
+def review_conflicts(ctx, invoice_no):
+    """检测同一发票被不同操作者处理的冲突"""
+    reviewer = ctx.obj["reviewer"]
+    conflicts = reviewer.check_conflicts(invoice_no=invoice_no)
+
+    if not conflicts:
+        click.echo(click.style("✓ 未检测到冲突", fg="green"))
+        return
+
+    click.echo(click.style(f"✗ 检测到 {len(conflicts)} 个冲突", fg="red", bold=True))
+    click.echo()
+
+    for i, conflict in enumerate(conflicts, 1):
+        click.echo(f"=== 冲突 {i}: 发票 {conflict['invoice_no']} ===")
+        click.echo(f"匹配记录数: {conflict['match_count']}")
+        click.echo(f"涉及操作者: {', '.join(conflict['operators']) if conflict['operators'] else '-'}")
+        click.echo()
+
+        headers = ["匹配编号", "类型", "状态", "收款号", "金额", "操作人", "备注"]
+        rows = []
+        for m in conflict["matches"]:
+            rows.append([
+                m["match_no"],
+                m["match_type_label"],
+                m["status_label"],
+                m["payment_no"],
+                f"{m['inv_amount']:.2f}",
+                m["operator"] or "-",
+                (m.get("operator_remark") or "")[:30],
+            ])
+        print_table(headers, rows)
+        click.echo()
 
 
 if __name__ == "__main__":

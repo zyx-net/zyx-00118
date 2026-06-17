@@ -70,8 +70,8 @@ class Config:
             errors.append("金额容差不能为负数")
         if self.date_window_days < 0:
             errors.append("日期窗口天数不能为负数")
-        if self.export_format not in ["xlsx", "csv"]:
-            errors.append(f"不支持的导出格式: {self.export_format}，仅支持 xlsx 和 csv")
+        if self.export_format not in ["xlsx", "csv", "json"]:
+            errors.append(f"不支持的导出格式: {self.export_format}，仅支持 xlsx、csv 和 json")
         if not self.invoice_required_columns:
             errors.append("发票必填列不能为空")
         if not self.payment_required_columns:

@@ -12,6 +12,10 @@
 - **断点恢复**：基于 SQLite 的持久化存储，程序退出后可继续
 - **差异报告**：含稳定编号、匹配证据、状态变化、人工备注
 - **去重机制**：重复导入同一文件不会产生重复记录
+- **复核快照**：按批次生成复核快照，带稳定编号，支持多次导出不改号
+- **回放校验**：对比当前状态与历史快照，检测差异
+- **冲突检测**：识别同一发票被不同操作者重复处理的冲突
+- **多格式导出**：支持 xlsx、csv、json 三种格式导出
 
 ## 安装
 
@@ -124,14 +128,58 @@ python -m invoice_reconciler.cli.main revoke history --match-id 1
 ### 9. 导出报告
 
 ```bash
-# 导出完整报告
+# 导出完整报告（默认格式）
 python -m invoice_reconciler.cli.main export full --operator 张三
 
+# 导出完整报告（指定 JSON 格式）
+python -m invoice_reconciler.cli.main export full --operator 张三 --format json
+
+# 导出完整报告（指定 CSV 格式）
+python -m invoice_reconciler.cli.main export full --operator 张三 --format csv
+
 # 导出差异报告
-python -m invoice_reconciler.cli.main export diff --operator 张三
+python -m invoice_reconciler.cli.main export diff --operator 张三 --format json
 ```
 
-### 10. 查看未匹配项
+### 10. 复核快照管理
+
+```bash
+# 创建复核快照
+python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "第一轮核对完成"
+
+# 列出所有快照
+python -m invoice_reconciler.cli.main review snapshot list
+
+# 查看快照详情
+python -m invoice_reconciler.cli.main review snapshot show --snapshot-no R202606180001
+
+# 导出快照（JSON 格式）
+python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format json
+
+# 导出快照（CSV 格式）
+python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format csv
+```
+
+### 11. 回放校验
+
+```bash
+# 对比当前状态与历史快照
+python -m invoice_reconciler.cli.main review replay --snapshot-no R202606180001
+
+# 查看校验结果，确认状态是否一致
+```
+
+### 12. 冲突检测
+
+```bash
+# 检测所有冲突
+python -m invoice_reconciler.cli.main review conflicts
+
+# 检测指定发票的冲突
+python -m invoice_reconciler.cli.main review conflicts --invoice-no INV001
+```
+
+### 13. 查看未匹配项
 
 ```bash
 # 查看所有未匹配项
@@ -144,7 +192,7 @@ python -m invoice_reconciler.cli.main list-unmatched --type invoices
 python -m invoice_reconciler.cli.main list-unmatched --type payments
 ```
 
-### 11. 断点恢复 - 重复导入测试
+### 14. 断点恢复 - 重复导入测试
 
 ```bash
 # 再次导入同一文件（应提示跳过）
@@ -172,7 +220,7 @@ payment_required_columns:       # 收款必填列
   - payment_date
   - customer
   - amount
-export_format: xlsx             # 导出格式：xlsx 或 csv
+export_format: xlsx             # 导出格式：xlsx、csv 或 json
 db_path: invoice_reconciler/data/reconciler.db  # 数据库路径
 export_dir: invoice_reconciler/exports          # 导出目录
 ```
@@ -273,7 +321,8 @@ invoice_reconciler/
 │   ├── importer.py          # CSV 导入
 │   ├── matcher.py           # 匹配引擎
 │   ├── revoker.py           # 撤销操作
-│   └── exporter.py          # 报告导出
+│   ├── exporter.py          # 报告导出
+│   └── reviewer.py          # 复核快照与回放校验
 ├── data/
 │   ├── config.yaml          # 配置文件
 │   ├── sample_invoices.csv  # 示例发票数据
@@ -296,7 +345,64 @@ A: 不可以。撤销操作是单向的，已撤销的匹配不能再次撤销�
 A: 先撤销该匹配，然后重新进行匹配或人工匹配。
 
 ### Q: 支持哪些导出格式？
-A: 支持 xlsx（Excel）和 csv 两种格式，可通过配置修改。
+A: 支持 xlsx（Excel）、csv 和 json 三种格式，可通过配置或命令行参数指定。
+
+### Q: 什么是复核快照？
+A: 复核快照是某一时刻所有匹配状态的完整存档，带稳定编号。同一快照可多次导出，编号始终不变。
+
+### Q: 回放校验有什么用？
+A: 回放校验可以对比当前数据状态与历史快照，检测是否有状态变更、新增或缺失的记录，用于审计和对账。
+
+### Q: 什么是冲突检测？
+A: 冲突检测用于识别同一张发票被不同操作者重复处理的情况，防止重复核销。
+
+### Q: 程序重启后快照和历史会丢失吗？
+A: 不会。所有快照、状态历史和匹配数据都保存在 SQLite 数据库中，程序重启后可以继续操作。
+
+## 从导入到回放校验的完整命令链
+
+以下是一个完整的对账复核流程示例：
+
+```bash
+# 1. 导入数据
+python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 张三
+python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sample_payments.csv --operator 张三
+
+# 2. 自动匹配
+python -m invoice_reconciler.cli.main match --operator 张三
+
+# 3. 创建导入后快照（用于后续回放对比）
+python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "自动匹配完成"
+
+# 4. 人工确认待匹配项
+python -m invoice_reconciler.cli.main confirm list --status pending
+python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
+
+# 5. 创建确认后快照
+python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "第一轮人工确认完成"
+
+# 6. 导出快照（JSON 格式，带稳定编号）
+python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format json
+
+# 7. 导出快照（CSV 格式，同一编号重复导出）
+python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format csv
+
+# 8. 撤销某条匹配
+python -m invoice_reconciler.cli.main revoke match 1 --operator 李四 --remark "匹配错误"
+
+# 9. 回放校验（检测与快照的差异）
+python -m invoice_reconciler.cli.main review replay --snapshot-no R202606180001
+
+# 10. 重做确认
+python -m invoice_reconciler.cli.main confirm approve 2 --operator 李四 --remark "重新确认"
+
+# 11. 冲突检测（检查同一发票是否被多人处理）
+python -m invoice_reconciler.cli.main review conflicts
+
+# 12. 创建最终快照并导出
+python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "最终复核完成"
+python -m invoice_reconciler.cli.main export full --operator 张三 --format json
+```
 
 ## 示例完整流程
 
