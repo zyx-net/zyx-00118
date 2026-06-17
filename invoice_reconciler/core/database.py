@@ -786,9 +786,11 @@ class Database:
             if invoice_no:
                 rows = conn.execute(
                     """SELECT m.*, i.invoice_no, i.invoice_date, i.customer as inv_customer,
-                              i.amount as inv_amount
+                              i.amount as inv_amount, p.payment_no, p.payment_date,
+                              p.customer as pay_customer, p.amount as pay_amount
                        FROM matches m
                        JOIN invoices i ON m.invoice_id = i.id
+                       LEFT JOIN payments p ON m.payment_id = p.id
                        WHERE i.invoice_no = ?
                        ORDER BY m.created_at""",
                     (invoice_no,)
@@ -796,9 +798,11 @@ class Database:
             else:
                 rows = conn.execute(
                     """SELECT m.*, i.invoice_no, i.invoice_date, i.customer as inv_customer,
-                              i.amount as inv_amount
+                              i.amount as inv_amount, p.payment_no, p.payment_date,
+                              p.customer as pay_customer, p.amount as pay_amount
                        FROM matches m
                        JOIN invoices i ON m.invoice_id = i.id
+                       LEFT JOIN payments p ON m.payment_id = p.id
                        ORDER BY i.invoice_no, m.created_at""",
                 ).fetchall()
 

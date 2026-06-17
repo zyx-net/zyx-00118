@@ -1,8 +1,20 @@
 import os
 import sys
+import io
 import json
 from datetime import datetime
 import click
+
+if sys.platform == "win32":
+    try:
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+        sys.stderr = io.TextIOWrapper(
+            sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+    except Exception:
+        pass
 
 from invoice_reconciler.core.config import Config
 from invoice_reconciler.core.database import (
@@ -376,10 +388,10 @@ def confirm_approve(ctx, match_id, operator, remark, select_payment):
 
     try:
         result = matcher.confirm_match(match_id, operator, remark, select_payment)
-        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
         click.echo(f"匹配编号: {result['match_no']}")
     except ValueError as e:
-        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
         sys.exit(1)
 
 
@@ -395,9 +407,9 @@ def confirm_reject(ctx, match_id, operator, remark):
 
     try:
         result = matcher.reject_match(match_id, operator, remark)
-        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
     except ValueError as e:
-        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
         sys.exit(1)
 
 
@@ -414,10 +426,10 @@ def confirm_manual(ctx, invoice_id, payment_id, operator, remark):
 
     try:
         result = matcher.manual_match(invoice_id, payment_id, operator, remark)
-        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
         click.echo(f"匹配编号: {result['match_no']}")
     except ValueError as e:
-        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
         sys.exit(1)
 
 
@@ -435,12 +447,18 @@ def confirm_candidates(ctx, invoice_id):
             click.echo("该发票暂无候选收款")
             return
 
-        click.echo(f"=== 发票 {candidates[0]['invoice_no']} 的候选收款 ===")
-        headers = ["候选ID", "收款号", "日期", "客户", "金额", "得分", "匹配原因"]
+        pending_matches = [m for m in db.get_matches_by_status(MATCH_STATUS_PENDING)
+                           if m["invoice_id"] == invoice_id]
+        match_info = ""
+        if pending_matches:
+            match_info = f" (匹配ID: {pending_matches[0]['id']}, 匹配编号: {pending_matches[0]['match_no']})"
+
+        click.echo(f"=== 发票 {candidates[0]['invoice_no']} 的候选收款{match_info} ===")
+        headers = ["收款ID", "收款号", "日期", "客户", "金额", "得分", "匹配原因"]
         rows = []
         for c in candidates:
             rows.append([
-                c["id"],
+                c["payment_id"],
                 c["payment_no"],
                 c["payment_date"],
                 c["pay_customer"],
@@ -449,6 +467,11 @@ def confirm_candidates(ctx, invoice_id):
                 c["match_reason"],
             ])
         print_table(headers, rows)
+        click.echo()
+        if pending_matches:
+            click.echo(f"操作: confirm approve {pending_matches[0]['id']} --select-payment <收款ID>")
+        else:
+            click.echo("提示: 该发票暂无待确认的匹配记录")
     else:
         invoices = matcher.get_multi_candidate_invoices()
         if not invoices:
@@ -489,11 +512,11 @@ def revoke_match(ctx, match_id, operator, remark):
 
     result = revoker.revoke_match(match_id, operator, remark)
     if result["success"]:
-        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
         click.echo(f"匹配编号: {result['match_no']}")
         click.echo(f"发票: {result['invoice_no']}, 收款: {result['payment_no']}")
     else:
-        click.echo(click.style(f"✗ {result['message']}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
         sys.exit(1)
 
 
@@ -509,9 +532,9 @@ def revoke_by_no(ctx, match_no, operator, remark):
 
     result = revoker.revoke_by_match_no(match_no, operator, remark)
     if result["success"]:
-        click.echo(click.style(f"✓ {result['message']}", fg="green"))
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
     else:
-        click.echo(click.style(f"✗ {result['message']}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
         sys.exit(1)
 
 
@@ -595,7 +618,7 @@ def export_full(ctx, operator, export_format):
     click.echo("正在生成完整报告...")
     result = exporter.export_full_report(operator, format=export_format)
 
-    click.echo(click.style(f"✓ 报告已生成: {result['file_path']}", fg="green"))
+    click.echo(click.style(f"[OK] 报告已生成: {result['file_path']}", fg="green"))
     click.echo(f"格式: {result['format']}")
     click.echo(f"生成时间: {result['generated_at']}")
     click.echo("\n报告摘要:")
@@ -616,7 +639,7 @@ def export_diff(ctx, operator, export_format):
     click.echo("正在生成差异报告...")
     result = exporter.export_diff_report(operator, format=export_format)
 
-    click.echo(click.style(f"✓ 差异报告已生成: {result['file_path']}", fg="green"))
+    click.echo(click.style(f"[OK] 差异报告已生成: {result['file_path']}", fg="green"))
     click.echo(f"格式: {result['format']}")
     click.echo(f"\n差异摘要:")
     click.echo(f"  未匹配发票金额: {result['unmatched_invoice_amount']:.2f}")
@@ -649,13 +672,13 @@ def export_snapshot(ctx, snapshot_no, snapshot_id, operator, export_format):
             snapshot_no=snapshot_no, snapshot_id=snapshot_id
         )
     except ValueError as e:
-        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
         sys.exit(1)
 
     click.echo("正在导出快照...")
     result = exporter.export_snapshot(snapshot_data, operator, format=export_format)
 
-    click.echo(click.style(f"✓ 快照已导出: {result['file_path']}", fg="green"))
+    click.echo(click.style(f"[OK] 快照已导出: {result['file_path']}", fg="green"))
     click.echo(f"快照编号: {result['snapshot_no']}")
     click.echo(f"格式: {result['format']}")
     click.echo(f"记录数: {result['item_count']}")
@@ -835,7 +858,7 @@ def snapshot_create(ctx, description, operator):
         operator=operator
     )
 
-    click.echo(click.style(f"✓ 快照已创建", fg="green"))
+    click.echo(click.style(f"[OK] 快照已创建", fg="green"))
     click.echo(f"快照编号: {snapshot['snapshot_no']}")
     click.echo(f"类型: {SNAPSHOT_TYPE_LABELS.get(snapshot['snapshot_type'], snapshot['snapshot_type'])}")
     click.echo(f"总匹配数: {snapshot['total_matches']}")
@@ -943,7 +966,7 @@ def review_replay(ctx, snapshot_no, snapshot_id):
     try:
         result = reviewer.replay_verify(snapshot_no=snapshot_no, snapshot_id=snapshot_id)
     except ValueError as e:
-        click.echo(click.style(f"✗ {e}", fg="red"), err=True)
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
         sys.exit(1)
 
     click.echo(f"=== 回放校验结果 ===")
@@ -961,9 +984,9 @@ def review_replay(ctx, snapshot_no, snapshot_id):
     click.echo()
 
     if result["is_consistent"]:
-        click.echo(click.style("✓ 校验通过：当前状态与快照完全一致", fg="green"))
+        click.echo(click.style("[OK] 校验通过：当前状态与快照完全一致", fg="green"))
     else:
-        click.echo(click.style(f"✗ 校验未通过：共 {len(result['differences'])} 处差异", fg="red", bold=True))
+        click.echo(click.style(f"[!!] 校验未通过：共 {len(result['differences'])} 处差异", fg="red", bold=True))
 
         if result["differences"]:
             click.echo("\n=== 差异明细 ===")
@@ -1002,10 +1025,10 @@ def review_conflicts(ctx, invoice_no):
     conflicts = reviewer.check_conflicts(invoice_no=invoice_no)
 
     if not conflicts:
-        click.echo(click.style("✓ 未检测到冲突", fg="green"))
+        click.echo(click.style("[OK] 未检测到冲突", fg="green"))
         return
 
-    click.echo(click.style(f"✗ 检测到 {len(conflicts)} 个冲突", fg="red", bold=True))
+    click.echo(click.style(f"[!!] 检测到 {len(conflicts)} 个冲突", fg="red", bold=True))
     click.echo()
 
     for i, conflict in enumerate(conflicts, 1):

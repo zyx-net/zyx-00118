@@ -93,13 +93,19 @@ python -m invoice_reconciler.cli.main confirm candidates
 ### 7. 人工确认匹配
 
 ```bash
+# 查看待确认列表
+python -m invoice_reconciler.cli.main confirm list --status pending
+
 # 查看匹配详情
 python -m invoice_reconciler.cli.main confirm show 1
 
 # 确认匹配
 python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
 
-# 多候选时选择特定收款
+# 查看多候选收款列表（显示收款ID，与 --select-payment 参数对应）
+python -m invoice_reconciler.cli.main confirm candidates --invoice-id 4
+
+# 多候选时选择特定收款（--select-payment 传入的是收款ID，即 candidates 列表中的"收款ID"列）
 python -m invoice_reconciler.cli.main confirm approve 3 --operator 张三 --select-payment 6 --remark "选择第二笔收款"
 
 # 拒绝匹配
@@ -359,6 +365,12 @@ A: 冲突检测用于识别同一张发票被不同操作者重复处理的情�
 ### Q: 程序重启后快照和历史会丢失吗？
 A: 不会。所有快照、状态历史和匹配数据都保存在 SQLite 数据库中，程序重启后可以继续操作。
 
+### Q: `--select-payment` 参数应该传什么值？
+A: 传**收款ID**（payment_id）。可以通过 `confirm candidates --invoice-id <发票ID>` 查看候选列表，列表中的"收款ID"列就是要传的值。注意不要和匹配ID（match_id）混淆，匹配ID是 `confirm approve` 的第一个参数。
+
+### Q: 匹配ID和收款ID有什么区别？
+A: 匹配ID（match_id）是 `matches` 表的主键，对应一条匹配记录；收款ID（payment_id）是 `payments` 表的主键，对应一笔收款。多候选场景下，一条待确认匹配（有匹配ID）可以选择不同的收款（用收款ID切换）。
+
 ## 从导入到回放校验的完整命令链
 
 以下是一个完整的对账复核流程示例：
@@ -371,35 +383,47 @@ python -m invoice_reconciler.cli.main import payments invoice_reconciler/data/sa
 # 2. 自动匹配
 python -m invoice_reconciler.cli.main match --operator 张三
 
-# 3. 创建导入后快照（用于后续回放对比）
+# 3. 查看匹配状态
+python -m invoice_reconciler.cli.main status
+python -m invoice_reconciler.cli.main confirm list --status pending
+
+# 4. 创建导入后快照（用于后续回放对比）
 python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "自动匹配完成"
 
-# 4. 人工确认待匹配项
-python -m invoice_reconciler.cli.main confirm list --status pending
+# 5. 查看多候选匹配
+python -m invoice_reconciler.cli.main confirm candidates
+
+# 6. 查看指定发票的候选收款（显示收款ID，用于 --select-payment 参数）
+python -m invoice_reconciler.cli.main confirm candidates --invoice-id 4
+
+# 7. 普通确认（单条匹配）
 python -m invoice_reconciler.cli.main confirm approve 2 --operator 张三 --remark "核对无误"
 
-# 5. 创建确认后快照
+# 8. 多候选确认（选择指定收款，--select-payment 传收款ID，即 candidates 列表中"收款ID"列）
+python -m invoice_reconciler.cli.main confirm approve 3 --operator 张三 --select-payment 6 --remark "选择第二笔收款"
+
+# 9. 按编号撤销匹配
+python -m invoice_reconciler.cli.main revoke by-no M202606180001 --operator 李四 --remark "匹配错误，需重新核对"
+
+# 10. 创建确认后快照
 python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "第一轮人工确认完成"
 
-# 6. 导出快照（JSON 格式，带稳定编号）
+# 11. 导出快照（JSON 格式，带稳定编号）
 python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format json
 
-# 7. 导出快照（CSV 格式，同一编号重复导出）
+# 12. 导出快照（CSV 格式，同一编号重复导出，内容一致）
 python -m invoice_reconciler.cli.main export snapshot --snapshot-no R202606180001 --operator 张三 --format csv
 
-# 8. 撤销某条匹配
-python -m invoice_reconciler.cli.main revoke match 1 --operator 李四 --remark "匹配错误"
-
-# 9. 回放校验（检测与快照的差异）
+# 13. 回放校验（检测当前状态与历史快照的差异）
 python -m invoice_reconciler.cli.main review replay --snapshot-no R202606180001
 
-# 10. 重做确认
-python -m invoice_reconciler.cli.main confirm approve 2 --operator 李四 --remark "重新确认"
-
-# 11. 冲突检测（检查同一发票是否被多人处理）
+# 14. 冲突检测（检查同一发票是否被多人重复处理）
 python -m invoice_reconciler.cli.main review conflicts
 
-# 12. 创建最终快照并导出
+# 15. 查看冲突详情（指定发票号）
+python -m invoice_reconciler.cli.main review conflicts --invoice-no INV001
+
+# 16. 创建最终快照并导出完整报告
 python -m invoice_reconciler.cli.main review snapshot create --operator 张三 --description "最终复核完成"
 python -m invoice_reconciler.cli.main export full --operator 张三 --format json
 ```
