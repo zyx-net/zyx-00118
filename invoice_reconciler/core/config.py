@@ -17,6 +17,10 @@ class Config:
     export_format: str = "xlsx"
     db_path: str = "invoice_reconciler/data/reconciler.db"
     export_dir: str = "invoice_reconciler/exports"
+    lock_timeout_seconds: int = 3600
+    default_user_role: str = "reviewer"
+    admin_users: List[str] = field(default_factory=lambda: ["admin"])
+    enable_lock: bool = True
 
     @classmethod
     def load(cls, config_path: Optional[str] = None) -> "Config":
@@ -47,7 +51,11 @@ class Config:
             ),
             export_format=data.get("export_format", "xlsx"),
             db_path=data.get("db_path", "invoice_reconciler/data/reconciler.db"),
-            export_dir=data.get("export_dir", "invoice_reconciler/exports")
+            export_dir=data.get("export_dir", "invoice_reconciler/exports"),
+            lock_timeout_seconds=data.get("lock_timeout_seconds", 3600),
+            default_user_role=data.get("default_user_role", "reviewer"),
+            admin_users=data.get("admin_users", ["admin"]),
+            enable_lock=data.get("enable_lock", True),
         )
 
     def save(self, config_path: str) -> None:
@@ -59,7 +67,11 @@ class Config:
             "payment_required_columns": self.payment_required_columns,
             "export_format": self.export_format,
             "db_path": self.db_path,
-            "export_dir": self.export_dir
+            "export_dir": self.export_dir,
+            "lock_timeout_seconds": self.lock_timeout_seconds,
+            "default_user_role": self.default_user_role,
+            "admin_users": self.admin_users,
+            "enable_lock": self.enable_lock,
         }
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -76,6 +88,10 @@ class Config:
             errors.append("发票必填列不能为空")
         if not self.payment_required_columns:
             errors.append("收款必填列不能为空")
+        if self.lock_timeout_seconds < 0:
+            errors.append("锁超时时间不能为负数")
+        if self.default_user_role not in ["reviewer", "admin"]:
+            errors.append(f"无效的默认用户角色: {self.default_user_role}")
         return errors
 
     def to_dict(self) -> Dict:
@@ -86,5 +102,9 @@ class Config:
             "payment_required_columns": self.payment_required_columns,
             "export_format": self.export_format,
             "db_path": self.db_path,
-            "export_dir": self.export_dir
+            "export_dir": self.export_dir,
+            "lock_timeout_seconds": self.lock_timeout_seconds,
+            "default_user_role": self.default_user_role,
+            "admin_users": self.admin_users,
+            "enable_lock": self.enable_lock,
         }

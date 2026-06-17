@@ -383,6 +383,7 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
         target_match_id = None
         target_match_no = None
         confirm_used = False
+        revoke_operator = "admin"
         if pending:
             target_match_id = pending[0]["id"]
             target_match_no = pending[0]["match_no"]
@@ -392,16 +393,20 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
                 "--remark", "第一轮确认"
             )
             confirm_used = True
+            revoke_operator = "确认员"
         else:
             matched = db.get_matches_by_status(MATCH_STATUS_MATCHED)
             target_match_id = matched[0]["id"]
             target_match_no = matched[0]["match_no"]
+            lock = db.get_match_lock(target_match_id)
+            if lock:
+                revoke_operator = lock["lock_owner"]
 
         self.assertIsNotNone(target_match_id)
 
         self._run_cmd(
             "revoke", "by-no", target_match_no,
-            "--operator", "复核员",
+            "--operator", revoke_operator,
             "--remark", "复核撤销"
         )
 
@@ -412,7 +417,7 @@ class TestCLIEncodingAndConflicts(unittest.TestCase):
         self.assertGreaterEqual(len(history), 1)
 
         ops = set(h["operator"] for h in history if h["operator"])
-        self.assertIn("复核员", ops)
+        self.assertIn(revoke_operator, ops)
         if confirm_used:
             self.assertIn("确认员", ops)
 

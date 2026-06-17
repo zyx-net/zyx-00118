@@ -1,10 +1,14 @@
 from typing import List, Dict, Optional
 from .database import Database, MATCH_STATUS_MATCHED, MATCH_STATUS_REVOKED
+from .workflow import WorkflowManager
+from .config import Config
 
 
 class Revoker:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, config: Config = None, workflow: WorkflowManager = None):
         self.db = db
+        self.config = config
+        self.workflow = workflow
 
     def revoke_match(self, match_id: int, operator: str,
                      remark: str = None) -> Dict:
@@ -40,8 +44,21 @@ class Revoker:
                 "message": "撤销操作必须指定操作者"
             }
 
+        if self.workflow and self.config and self.config.enable_lock:
+            can_operate, msg = self.workflow.can_operate_match(operator, match_id)
+            if not can_operate:
+                return {
+                    "success": False,
+                    "error_type": "lock_violation",
+                    "message": msg
+                }
+
         try:
             self.db.revoke_match(match_id, operator, remark)
+
+            if self.workflow and self.config and self.config.enable_lock:
+                self.workflow.auto_unlock_on_revoke(match_id, operator)
+
             return {
                 "success": True,
                 "match_id": match_id,

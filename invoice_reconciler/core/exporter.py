@@ -43,6 +43,32 @@ class ReportExporter:
         self.db = db
         os.makedirs(config.export_dir, exist_ok=True)
 
+    def _get_lock_info(self, match_id: int) -> Dict:
+        lock = self.db.get_match_lock(match_id)
+        if not lock:
+            return {
+                "当前责任人": "",
+                "锁定原因": "",
+                "锁定时间": "",
+                "锁到期时间": "",
+                "是否锁定": "否",
+            }
+        is_expired = "否"
+        if lock.get("lock_expires_at"):
+            try:
+                expire_time = datetime.strptime(lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S")
+                if expire_time <= datetime.now():
+                    is_expired = "是"
+            except (ValueError, TypeError):
+                pass
+        return {
+            "当前责任人": lock["lock_owner"],
+            "锁定原因": lock.get("lock_reason") or "",
+            "锁定时间": lock.get("locked_at") or "",
+            "锁到期时间": lock.get("lock_expires_at") or "",
+            "是否锁定": "是（已过期）" if is_expired == "是" else "是",
+        }
+
     def _generate_summary(self) -> List[Dict]:
         stats = self.db.get_statistics()
         config_info = self.config.to_dict()
@@ -78,7 +104,9 @@ class ReportExporter:
                 for h in history
             ])
 
-            result.append({
+            lock_info = self._get_lock_info(m["id"])
+
+            item = {
                 "匹配编号": m["match_no"],
                 "匹配类型": MATCH_TYPE_LABELS.get(m["match_type"], m["match_type"]),
                 "匹配状态": STATUS_LABELS.get(m["status"], m["status"]),
@@ -102,14 +130,17 @@ class ReportExporter:
                 "确认时间": m["confirmed_at"],
                 "创建时间": m["created_at"],
                 "状态历史": history_str,
-            })
+            }
+            item.update(lock_info)
+            result.append(item)
         return result
 
     def _generate_pending_data(self) -> List[Dict]:
         matches = self.db.get_matches_by_status(MATCH_STATUS_PENDING)
         result = []
         for m in matches:
-            result.append({
+            lock_info = self._get_lock_info(m["id"])
+            item = {
                 "匹配编号": m["match_no"],
                 "匹配类型": MATCH_TYPE_LABELS.get(m["match_type"], m["match_type"]),
                 "匹配状态": STATUS_LABELS.get(m["status"], m["status"]),
@@ -128,7 +159,9 @@ class ReportExporter:
                 "金额差异": abs(m["inv_amount"] - m["pay_amount"]),
                 "当前备注": m["operator_remark"] or "",
                 "创建时间": m["created_at"],
-            })
+            }
+            item.update(lock_info)
+            result.append(item)
         return result
 
     def _generate_exception_data(self) -> List[Dict]:
@@ -143,7 +176,9 @@ class ReportExporter:
                 for h in history
             ])
 
-            result.append({
+            lock_info = self._get_lock_info(m["id"])
+
+            item = {
                 "匹配编号": m["match_no"],
                 "匹配类型": MATCH_TYPE_LABELS.get(m["match_type"], m["match_type"]),
                 "匹配状态": STATUS_LABELS.get(m["status"], m["status"]),
@@ -159,7 +194,9 @@ class ReportExporter:
                 "拒绝原因": m["operator_remark"] or "",
                 "处理时间": m["confirmed_at"],
                 "状态历史": history_str,
-            })
+            }
+            item.update(lock_info)
+            result.append(item)
         return result
 
     def _generate_unmatched_invoices(self) -> List[Dict]:
@@ -212,7 +249,9 @@ class ReportExporter:
                 for h in history
             ])
 
-            result.append({
+            lock_info = self._get_lock_info(m["id"])
+
+            item = {
                 "匹配编号": m["match_no"],
                 "匹配类型": MATCH_TYPE_LABELS.get(m["match_type"], m["match_type"]),
                 "匹配状态": STATUS_LABELS.get(m["status"], m["status"]),
@@ -222,7 +261,9 @@ class ReportExporter:
                 "收款金额": m["pay_amount"],
                 "撤销备注": m["operator_remark"] or "",
                 "状态历史": history_str,
-            })
+            }
+            item.update(lock_info)
+            result.append(item)
         return result
 
     def _generate_errors_data(self) -> List[Dict]:

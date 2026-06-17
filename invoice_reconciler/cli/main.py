@@ -33,6 +33,11 @@ from invoice_reconciler.core.reviewer import (
     SNAPSHOT_TYPE_LABELS,
     SNAPSHOT_TYPE_MANUAL,
 )
+from invoice_reconciler.core.workflow import (
+    WorkflowManager,
+    LOCK_STATUS_LABELS,
+    USER_ROLE_LABELS,
+)
 
 
 def get_current_user() -> str:
@@ -71,12 +76,14 @@ def cli(ctx, config_path):
             sys.exit(1)
 
         db = Database(config.db_path)
+        workflow = WorkflowManager(config, db)
         ctx.obj = {
             "config": config,
             "db": db,
+            "workflow": workflow,
             "importer": CSVImporter(config, db),
-            "matcher": MatchEngine(config, db),
-            "revoker": Revoker(db),
+            "matcher": MatchEngine(config, db, workflow),
+            "revoker": Revoker(db, config, workflow),
             "exporter": ReportExporter(config, db),
             "reviewer": ReviewSnapshot(db),
         }
@@ -1051,6 +1058,323 @@ def review_conflicts(ctx, invoice_no):
             ])
         print_table(headers, rows)
         click.echo()
+
+
+@cli.group()
+def lock():
+    """工单锁定管理"""
+    pass
+
+
+@lock.command("list")
+@click.option("--all", "show_all", is_flag=True, help="显示所有锁（包括已过期）")
+@click.option("--owner", default=None, help="按持有人过滤")
+@click.option("--operator", default=None, help="当前操作者（用于权限判断的备选）")
+@click.pass_context
+def lock_list(ctx, show_all, owner, operator):
+    """列出锁定记录"""
+    workflow = ctx.obj["workflow"]
+    current_operator = operator or get_current_user()
+
+    if owner:
+        locks = workflow.get_locks_by_owner(owner)
+    else:
+        locks = workflow.list_all_locks(include_expired=show_all)
+
+    if not locks:
+        click.echo("暂无锁定记录")
+        return
+
+    headers = ["锁ID", "匹配ID", "匹配编号", "匹配状态", "发票号", "收款号", "持有人", "锁定原因", "锁定时间", "到期时间", "是否过期"]
+    rows = []
+    for lock in locks:
+        is_expired = "否"
+        if lock.get("lock_expires_at"):
+            try:
+                from datetime import datetime
+                expire_time = datetime.strptime(lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S")
+                if expire_time <= datetime.now():
+                    is_expired = "是"
+            except (ValueError, TypeError):
+                pass
+        rows.append([
+            lock["id"],
+            lock["match_id"],
+            lock["match_no"],
+            STATUS_LABELS.get(lock.get("match_status"), lock.get("match_status", "-")),
+            lock["invoice_no"],
+            lock["payment_no"],
+            lock["lock_owner"],
+            (lock.get("lock_reason") or "")[:20],
+            lock.get("locked_at", "-"),
+            lock.get("lock_expires_at", "-"),
+            is_expired,
+        ])
+    print_table(headers, rows)
+    click.echo(f"\n共 {len(locks)} 条锁定记录")
+
+
+@lock.command("acquire")
+@click.argument("match_id", type=int)
+@click.option("--operator", default=None, help="操作者")
+@click.option("--reason", default=None, help="锁定原因")
+@click.pass_context
+def lock_acquire(ctx, match_id, operator, reason):
+    """锁定匹配记录"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.acquire_lock(match_id, operator, reason)
+        if result.get("skipped"):
+            click.echo(click.style(result["message"], fg="yellow"))
+        elif result.get("already_locked"):
+            click.echo(click.style(result["message"], fg="yellow"))
+        else:
+            click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+            click.echo(f"匹配编号: {result['match_no']}")
+            click.echo(f"持有人: {result['owner']}")
+            if result.get("expires_at"):
+                click.echo(f"到期时间: {result['expires_at']}")
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@lock.command("release")
+@click.argument("match_id", type=int)
+@click.option("--operator", default=None, help="操作者")
+@click.option("--reason", default=None, help="解锁原因")
+@click.pass_context
+def lock_release(ctx, match_id, operator, reason):
+    """解锁匹配记录"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.release_lock(match_id, operator, reason)
+        if result.get("skipped"):
+            click.echo(click.style(result["message"], fg="yellow"))
+        elif result["success"]:
+            click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+            click.echo(f"匹配编号: {result['match_no']}")
+            click.echo(f"原持有人: {result['old_owner']}")
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+            sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@lock.command("transfer")
+@click.argument("match_id", type=int)
+@click.argument("to_user")
+@click.option("--operator", default=None, help="当前操作者")
+@click.option("--reason", default=None, help="转交原因")
+@click.pass_context
+def lock_transfer(ctx, match_id, to_user, operator, reason):
+    """转交匹配记录"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.transfer_lock(match_id, operator, to_user, reason)
+        if result.get("skipped"):
+            click.echo(click.style(result["message"], fg="yellow"))
+        else:
+            click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+            click.echo(f"匹配编号: {result['match_no']}")
+            click.echo(f"原持有人: {result['old_owner']}")
+            click.echo(f"新持有人: {result['new_owner']}")
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@lock.command("takeover")
+@click.argument("match_id", type=int)
+@click.option("--operator", default=None, help="操作者")
+@click.option("--reason", default=None, help="接管原因")
+@click.pass_context
+def lock_takeover(ctx, match_id, operator, reason):
+    """接管匹配记录"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.takeover_lock(match_id, operator, reason)
+        if result.get("skipped"):
+            click.echo(click.style(result["message"], fg="yellow"))
+        elif result.get("already_locked"):
+            click.echo(click.style(result["message"], fg="yellow"))
+        else:
+            click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+            click.echo(f"匹配编号: {result['match_no']}")
+            if result.get("old_owner"):
+                click.echo(f"原持有人: {result['old_owner']}")
+            click.echo(f"新持有人: {result['new_owner']}")
+            if result.get("was_expired"):
+                click.echo(click.style("原锁已过期", fg="yellow"))
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@lock.command("force-unlock")
+@click.argument("match_id", type=int)
+@click.option("--operator", default=None, help="操作者（需管理员权限）")
+@click.option("--reason", default=None, help="强制解锁原因")
+@click.pass_context
+def lock_force_unlock(ctx, match_id, operator, reason):
+    """强制解锁（仅管理员）"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.force_unlock(match_id, operator, reason)
+        if result["success"]:
+            click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+            click.echo(f"匹配编号: {result['match_no']}")
+            click.echo(f"原持有人: {result['old_owner']}")
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+            sys.exit(1)
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@lock.command("batch-unlock")
+@click.option("--operator", default=None, help="操作者（需管理员权限）")
+@click.option("--reason", default=None, help="批量解锁原因")
+@click.option("--owner", default=None, help="仅解锁指定持有人的锁")
+@click.pass_context
+def lock_batch_unlock(ctx, operator, reason, owner):
+    """批量解锁（仅管理员）"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.batch_force_unlock(operator, reason, owner)
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@lock.command("history")
+@click.option("--match-id", type=int, default=None, help="匹配ID")
+@click.option("--match-no", default=None, help="匹配编号")
+@click.option("--operator", default=None, help="按操作人过滤")
+@click.option("--limit", type=int, default=50, help="显示条数")
+@click.pass_context
+def lock_history(ctx, match_id, match_no, operator, limit):
+    """查看锁操作历史"""
+    workflow = ctx.obj["workflow"]
+    db = ctx.obj["db"]
+
+    if match_no and not match_id:
+        match = db.get_match_by_no(match_no)
+        if match:
+            match_id = match["id"]
+
+    history = workflow.get_lock_history(match_id=match_id, operator=operator, limit=limit)
+
+    if not history:
+        click.echo("暂无锁操作历史")
+        return
+
+    headers = ["ID", "匹配ID", "操作类型", "操作人", "原持有人", "新持有人", "原因", "操作时间"]
+    rows = []
+    for h in history:
+        rows.append([
+            h["id"],
+            h["match_id"],
+            h.get("action_label", h["action"]),
+            h["operator"],
+            h.get("old_owner") or "-",
+            h.get("new_owner") or "-",
+            (h.get("reason") or "")[:30],
+            h["created_at"],
+        ])
+    print_table(headers, rows)
+
+
+@cli.group()
+def user():
+    """用户与角色管理"""
+    pass
+
+
+@user.command("list")
+@click.option("--operator", default=None, help="当前操作者（用于权限判断）")
+@click.pass_context
+def user_list(ctx, operator):
+    """列出所有用户"""
+    workflow = ctx.obj["workflow"]
+    current_op = operator or get_current_user()
+
+    if not workflow.is_admin(current_op):
+        click.echo(click.style("[!!] 只有管理员可以查看用户列表", fg="red"), err=True)
+        sys.exit(1)
+
+    users = workflow.list_users()
+    if not users:
+        click.echo("暂无用户")
+        return
+
+    headers = ["ID", "用户名", "角色", "状态", "创建时间"]
+    rows = []
+    for u in users:
+        rows.append([
+            u["id"],
+            u["username"],
+            u.get("role_label", u.get("role", "-")),
+            u.get("status", "-"),
+            u.get("created_at", "-"),
+        ])
+    print_table(headers, rows)
+
+
+@user.command("set-role")
+@click.argument("username")
+@click.argument("role", type=click.Choice(["reviewer", "admin"]))
+@click.option("--operator", default=None, help="当前操作者（需管理员权限）")
+@click.pass_context
+def user_set_role(ctx, username, role, operator):
+    """设置用户角色（仅管理员）"""
+    workflow = ctx.obj["workflow"]
+    operator = operator or get_current_user()
+
+    try:
+        result = workflow.update_user_role(operator, username, role)
+        click.echo(click.style(f"[OK] {result['message']}", fg="green"))
+    except ValueError as e:
+        click.echo(click.style(f"[!!] {e}", fg="red"), err=True)
+        sys.exit(1)
+
+
+@user.command("info")
+@click.option("--username", default=None, help="查询的用户名，默认当前用户")
+@click.pass_context
+def user_info(ctx, username):
+    """查看用户信息和锁统计"""
+    workflow = ctx.obj["workflow"]
+    username = username or get_current_user()
+
+    role = workflow.get_user_role(username)
+    role_label = USER_ROLE_LABELS.get(role, role)
+    summary = workflow.get_user_locks_summary(username)
+
+    click.echo(f"=== 用户信息 ===")
+    click.echo(f"用户名: {username}")
+    click.echo(f"角色: {role_label}")
+    click.echo()
+    click.echo(f"=== 锁统计 ===")
+    click.echo(f"总锁定数: {summary['total_locks']}")
+    click.echo(f"有效锁: {summary['active_locks']}")
+    click.echo(f"已过期: {summary['expired_locks']}")
 
 
 if __name__ == "__main__":

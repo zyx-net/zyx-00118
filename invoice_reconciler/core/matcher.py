@@ -5,6 +5,7 @@ from .config import Config
 from .database import (
     Database, MATCH_STATUS_MATCHED, MATCH_STATUS_PENDING, MATCH_STATUS_EXCEPTION
 )
+from .workflow import WorkflowManager
 
 
 MATCH_TYPE_AUTO_EXACT = "auto_exact"
@@ -14,9 +15,10 @@ MATCH_TYPE_MANUAL = "manual"
 
 
 class MatchEngine:
-    def __init__(self, config: Config, db: Database):
+    def __init__(self, config: Config, db: Database, workflow: WorkflowManager = None):
         self.config = config
         self.db = db
+        self.workflow = workflow
 
     def run_auto_matching(self, operator: str = None) -> Dict:
         self.db.clear_match_candidates()
@@ -174,6 +176,11 @@ class MatchEngine:
                 f"只能确认待确认状态的匹配，当前状态: {match['status']}"
             )
 
+        if self.workflow and self.config.enable_lock:
+            can_operate, msg = self.workflow.can_operate_match(operator, match_id)
+            if not can_operate:
+                raise ValueError(msg)
+
         if selected_payment_id and selected_payment_id != match["payment_id"]:
             candidates = self.db.get_match_candidates(match["invoice_id"])
             valid_candidate = any(
@@ -193,6 +200,9 @@ class MatchEngine:
 
         self.db.confirm_match(match_id, operator, remark)
 
+        if self.workflow and self.config.enable_lock:
+            self.workflow.auto_lock_on_confirm(match_id, operator)
+
         return {
             "success": True,
             "match_id": match_id,
@@ -202,6 +212,11 @@ class MatchEngine:
 
     def reject_match(self, match_id: int, operator: str,
                      remark: str = None) -> Dict:
+        if self.workflow and self.config.enable_lock:
+            can_operate, msg = self.workflow.can_operate_match(operator, match_id)
+            if not can_operate:
+                raise ValueError(msg)
+
         self.db.reject_match(match_id, operator, remark)
         return {
             "success": True,
@@ -240,11 +255,20 @@ class MatchEngine:
             evidence, MATCH_STATUS_MATCHED, operator, remark
         )
 
+        if self.workflow and self.config.enable_lock:
+            self.workflow.auto_lock_on_confirm(
+                self._get_match_id_by_no(match_no), operator
+            )
+
         return {
             "success": True,
             "match_no": match_no,
             "message": "人工匹配完成"
         }
+
+    def _get_match_id_by_no(self, match_no: str) -> Optional[int]:
+        match = self.db.get_match_by_no(match_no)
+        return match["id"] if match else None
 
     def get_match_summary(self) -> Dict:
         matches = self.db.get_matches_by_status()

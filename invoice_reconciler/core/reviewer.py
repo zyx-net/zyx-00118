@@ -9,6 +9,7 @@ from .database import (
     MATCH_STATUS_REVOKED,
 )
 from .exporter import STATUS_LABELS, MATCH_TYPE_LABELS
+from .workflow import LOCK_STATUS_LABELS
 
 
 SNAPSHOT_TYPE_MANUAL = "manual"
@@ -171,6 +172,34 @@ class ReviewSnapshot:
                 for c in candidates
             ])
 
+            lock_history = item.get("lock_history", [])
+            lock_history_str = "; ".join([
+                f"{lh['created_at']}: {LOCK_STATUS_LABELS.get(lh['action'], lh['action'])} "
+                f"(操作人: {lh['operator']}, 原持有人: {lh['old_owner'] or '-'}, "
+                f"新持有人: {lh['new_owner'] or '-'}, 原因: {lh['reason'] or '-'})"
+                for lh in lock_history
+            ])
+
+            last_confirm_evidence = item.get("last_confirm_evidence")
+            if isinstance(last_confirm_evidence, dict):
+                last_confirm_evidence_str = (
+                    f"确认人: {last_confirm_evidence.get('operator', '-')}, "
+                    f"备注: {last_confirm_evidence.get('remark', '-')}, "
+                    f"确认时间: {last_confirm_evidence.get('confirmed_at', '-')}, "
+                    f"匹配类型: {MATCH_TYPE_LABELS.get(last_confirm_evidence.get('match_type'), last_confirm_evidence.get('match_type', '-'))}, "
+                    f"得分: {last_confirm_evidence.get('match_score', '-')}, "
+                    f"证据: {last_confirm_evidence.get('match_evidence', '-')}"
+                )
+            else:
+                last_confirm_evidence_str = ""
+
+            takeover_reason = ""
+            if lock_history:
+                for lh in lock_history:
+                    if lh.get("action") == "takeover" and lh.get("reason"):
+                        takeover_reason = lh["reason"]
+                        break
+
             export_items.append({
                 "匹配编号": item["match_no"],
                 "匹配类型": MATCH_TYPE_LABELS.get(item["match_type"], item["match_type"]),
@@ -192,6 +221,13 @@ class ReviewSnapshot:
                 "创建时间": item["created_at"] or "",
                 "候选收款证据": candidate_str,
                 "状态历史": history_str,
+                "当前责任人": item.get("current_owner") or "",
+                "锁定原因": item.get("lock_reason") or "",
+                "锁定时间": item.get("locked_at") or "",
+                "锁到期时间": item.get("lock_expires_at") or "",
+                "锁历史": lock_history_str,
+                "接管原因": takeover_reason,
+                "最后确认证据": last_confirm_evidence_str,
                 "快照编号": snapshot["snapshot_no"],
                 "快照生成时间": snapshot["created_at"],
             })

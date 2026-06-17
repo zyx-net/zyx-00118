@@ -18,6 +18,19 @@ INVOICE_STATUS_INVALID = "invalid"
 PAYMENT_STATUS_NORMAL = "normal"
 PAYMENT_STATUS_INVALID = "invalid"
 
+USER_ROLE_REVIEWER = "reviewer"
+USER_ROLE_ADMIN = "admin"
+
+USER_STATUS_ACTIVE = "active"
+USER_STATUS_INACTIVE = "inactive"
+
+LOCK_ACTION_LOCK = "lock"
+LOCK_ACTION_UNLOCK = "unlock"
+LOCK_ACTION_TRANSFER = "transfer"
+LOCK_ACTION_TAKEOVER = "takeover"
+LOCK_ACTION_FORCE_UNLOCK = "force_unlock"
+LOCK_ACTION_AUTO_EXPIRE = "auto_expire"
+
 
 class Database:
     def __init__(self, db_path: str):
@@ -211,11 +224,58 @@ class Database:
                     created_at TEXT,
                     status_history TEXT,
                     candidate_payments TEXT,
+                    current_owner TEXT,
+                    lock_reason TEXT,
+                    locked_at TEXT,
+                    lock_expires_at TEXT,
+                    lock_history TEXT,
+                    last_confirm_evidence TEXT,
                     FOREIGN KEY (snapshot_id) REFERENCES review_snapshots(id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_snapshot_items_snapshot ON snapshot_items(snapshot_id);
                 CREATE INDEX IF NOT EXISTS idx_snapshot_items_match ON snapshot_items(match_no);
+
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'reviewer',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_login_at DATETIME
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+                CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+
+                CREATE TABLE IF NOT EXISTS match_locks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_id INTEGER UNIQUE NOT NULL,
+                    lock_owner TEXT NOT NULL,
+                    lock_reason TEXT,
+                    locked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    lock_expires_at DATETIME,
+                    FOREIGN KEY (match_id) REFERENCES matches(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_match_locks_owner ON match_locks(lock_owner);
+                CREATE INDEX IF NOT EXISTS idx_match_locks_expires ON match_locks(lock_expires_at);
+
+                CREATE TABLE IF NOT EXISTS lock_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    match_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    operator TEXT NOT NULL,
+                    reason TEXT,
+                    old_owner TEXT,
+                    new_owner TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (match_id) REFERENCES matches(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_lock_history_match ON lock_history(match_id);
+                CREATE INDEX IF NOT EXISTS idx_lock_history_action ON lock_history(action);
+                CREATE INDEX IF NOT EXISTS idx_lock_history_operator ON lock_history(operator);
             """)
 
     @staticmethod
@@ -692,6 +752,26 @@ class Database:
                 candidates = self.get_match_candidates(invoice_id=m["invoice_id"])
                 candidates_json = json.dumps(candidates, ensure_ascii=False) if candidates else "[]"
 
+                lock = self.get_match_lock(m["id"])
+                current_owner = lock["lock_owner"] if lock else None
+                lock_reason = lock["lock_reason"] if lock else None
+                locked_at = lock["locked_at"] if lock else None
+                lock_expires_at = lock["lock_expires_at"] if lock else None
+
+                lock_history = self.get_lock_history(match_id=m["id"])
+                lock_history_json = json.dumps(lock_history, ensure_ascii=False) if lock_history else "[]"
+
+                last_confirm_evidence = None
+                if m["status"] == MATCH_STATUS_MATCHED:
+                    last_confirm_evidence = json.dumps({
+                        "operator": m["operator"],
+                        "remark": m["operator_remark"],
+                        "confirmed_at": m["confirmed_at"],
+                        "match_type": m["match_type"],
+                        "match_score": m["match_score"],
+                        "match_evidence": m["match_evidence"],
+                    }, ensure_ascii=False)
+
                 conn.execute(
                     """INSERT INTO snapshot_items
                        (snapshot_id, match_id, match_no, match_type, match_score,
@@ -699,15 +779,20 @@ class Database:
                         inv_customer, inv_amount, inv_batch_id,
                         payment_id, payment_no, payment_date, pay_customer,
                         pay_amount, pay_batch_id, operator, operator_remark,
-                        confirmed_at, created_at, status_history, candidate_payments)
+                        confirmed_at, created_at, status_history, candidate_payments,
+                        current_owner, lock_reason, locked_at, lock_expires_at,
+                        lock_history, last_confirm_evidence)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?)""",
                     (snapshot_id, m["id"], m["match_no"], m["match_type"], m["match_score"],
                      m["match_evidence"], m["status"], m["invoice_id"], m["invoice_no"],
                      m["invoice_date"], m["inv_customer"], m["inv_amount"], m.get("batch_id"),
                      m["payment_id"], m["payment_no"], m["payment_date"], m["pay_customer"],
                      m["pay_amount"], None, m["operator"], m["operator_remark"],
-                     m["confirmed_at"], m["created_at"], history_json, candidates_json)
+                     m["confirmed_at"], m["created_at"], history_json, candidates_json,
+                     current_owner, lock_reason, locked_at, lock_expires_at,
+                     lock_history_json, last_confirm_evidence)
                 )
 
         return self.get_snapshot_by_no(snapshot_no)
@@ -779,6 +864,16 @@ class Database:
                         item["candidate_payments"] = json.loads(item["candidate_payments"])
                     except (json.JSONDecodeError, TypeError):
                         item["candidate_payments"] = []
+                if item.get("lock_history"):
+                    try:
+                        item["lock_history"] = json.loads(item["lock_history"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["lock_history"] = []
+                if item.get("last_confirm_evidence"):
+                    try:
+                        item["last_confirm_evidence"] = json.loads(item["last_confirm_evidence"])
+                    except (json.JSONDecodeError, TypeError):
+                        item["last_confirm_evidence"] = None
             return items
 
     def check_invoice_conflicts(self, invoice_no: str = None) -> List[Dict]:
@@ -831,3 +926,535 @@ class Database:
                         "matches": matches
                     })
             return conflicts
+
+    def get_user(self, username: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (username,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def create_user(self, username: str, role: str = USER_ROLE_REVIEWER,
+                    status: str = USER_STATUS_ACTIVE) -> int:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO users (username, role, status)
+                   VALUES (?, ?, ?)""",
+                (username, role, status)
+            )
+            if cursor.lastrowid == 0:
+                row = conn.execute(
+                    "SELECT id FROM users WHERE username = ?",
+                    (username,)
+                ).fetchone()
+                return row["id"]
+            return cursor.lastrowid
+
+    def update_user_role(self, username: str, role: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                "UPDATE users SET role = ? WHERE username = ?",
+                (role, username)
+            )
+
+    def list_users(self) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM users ORDER BY username"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_match_lock(self, match_id: int) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM match_locks WHERE match_id = ?",
+                (match_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def is_lock_expired(self, match_id: int) -> bool:
+        lock = self.get_match_lock(match_id)
+        if not lock:
+            return False
+        if not lock.get("lock_expires_at"):
+            return False
+        try:
+            expire_time = datetime.strptime(
+                lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S"
+            )
+            return expire_time <= datetime.now()
+        except (ValueError, TypeError):
+            return False
+
+    def get_locks_by_owner(self, owner: str) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT ml.*, m.match_no, m.status as match_status,
+                          i.invoice_no, p.payment_no
+                   FROM match_locks ml
+                   JOIN matches m ON ml.match_id = m.id
+                   JOIN invoices i ON m.invoice_id = i.id
+                   JOIN payments p ON m.payment_id = p.id
+                   WHERE ml.lock_owner = ?
+                   ORDER BY ml.locked_at DESC""",
+                (owner,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_expired_locks(self, now: datetime = None) -> List[Dict]:
+        if now is None:
+            now = datetime.now()
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT ml.*, m.match_no, m.status as match_status,
+                          i.invoice_no, p.payment_no
+                   FROM match_locks ml
+                   JOIN matches m ON ml.match_id = m.id
+                   JOIN invoices i ON m.invoice_id = i.id
+                   JOIN payments p ON m.payment_id = p.id
+                   WHERE ml.lock_expires_at IS NOT NULL AND ml.lock_expires_at <= ?
+                   ORDER BY ml.lock_expires_at""",
+                (now.strftime("%Y-%m-%d %H:%M:%S"),)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def list_all_locks(self, include_expired: bool = False) -> List[Dict]:
+        with self._get_conn() as conn:
+            if include_expired:
+                rows = conn.execute(
+                    """SELECT ml.*, m.match_no, m.status as match_status,
+                              i.invoice_no, p.payment_no
+                       FROM match_locks ml
+                       JOIN matches m ON ml.match_id = m.id
+                       JOIN invoices i ON m.invoice_id = i.id
+                       JOIN payments p ON m.payment_id = p.id
+                       ORDER BY ml.locked_at DESC"""
+                ).fetchall()
+            else:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rows = conn.execute(
+                    """SELECT ml.*, m.match_no, m.status as match_status,
+                              i.invoice_no, p.payment_no
+                       FROM match_locks ml
+                       JOIN matches m ON ml.match_id = m.id
+                       JOIN invoices i ON m.invoice_id = i.id
+                       JOIN payments p ON m.payment_id = p.id
+                       WHERE ml.lock_expires_at IS NULL OR ml.lock_expires_at > ?
+                       ORDER BY ml.locked_at DESC""",
+                    (now,)
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def acquire_lock(self, match_id: int, owner: str, reason: str = None,
+                     expire_seconds: int = None) -> Dict:
+        match = self.get_match_by_id(match_id)
+        if not match:
+            raise ValueError(f"匹配记录不存在: {match_id}")
+
+        now = datetime.now()
+        expires_at = None
+        if expire_seconds and expire_seconds > 0:
+            from datetime import timedelta
+            expires_at = now + timedelta(seconds=expire_seconds)
+            expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            expires_at_str = None
+
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM match_locks WHERE match_id = ?",
+                (match_id,)
+            ).fetchone()
+
+            if existing:
+                existing_expires = existing["lock_expires_at"]
+                if existing_expires:
+                    expire_time = datetime.strptime(existing_expires, "%Y-%m-%d %H:%M:%S")
+                    if expire_time > now:
+                        if existing["lock_owner"] == owner:
+                            return {
+                                "success": True,
+                                "already_locked": True,
+                                "match_id": match_id,
+                                "match_no": match["match_no"],
+                                "owner": owner,
+                                "message": "您已锁定该记录"
+                            }
+                        raise ValueError(
+                            f"记录已被 {existing['lock_owner']} 锁定，"
+                            f"锁定时间: {existing['locked_at']}"
+                        )
+
+            if existing:
+                conn.execute(
+                    """UPDATE match_locks
+                       SET lock_owner = ?, lock_reason = ?, locked_at = ?,
+                           lock_expires_at = ?
+                       WHERE match_id = ?""",
+                    (owner, reason, now.strftime("%Y-%m-%d %H:%M:%S"),
+                     expires_at_str, match_id)
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO match_locks
+                       (match_id, lock_owner, lock_reason, locked_at, lock_expires_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (match_id, owner, reason,
+                     now.strftime("%Y-%m-%d %H:%M:%S"), expires_at_str)
+                )
+
+            old_owner = existing["lock_owner"] if existing else None
+            self._record_lock_history(
+                conn, match_id, LOCK_ACTION_LOCK, owner, reason,
+                old_owner, owner
+            )
+
+            return {
+                "success": True,
+                "already_locked": False,
+                "match_id": match_id,
+                "match_no": match["match_no"],
+                "owner": owner,
+                "locked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "expires_at": expires_at_str,
+                "message": "锁定成功"
+            }
+
+    def release_lock(self, match_id: int, operator: str, reason: str = None) -> Dict:
+        match = self.get_match_by_id(match_id)
+        if not match:
+            raise ValueError(f"匹配记录不存在: {match_id}")
+
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM match_locks WHERE match_id = ?",
+                (match_id,)
+            ).fetchone()
+
+            if not existing:
+                return {
+                    "success": False,
+                    "match_id": match_id,
+                    "match_no": match["match_no"],
+                    "message": "该记录未被锁定"
+                }
+
+            old_owner = existing["lock_owner"]
+
+            conn.execute("DELETE FROM match_locks WHERE match_id = ?", (match_id,))
+
+            self._record_lock_history(
+                conn, match_id, LOCK_ACTION_UNLOCK, operator, reason,
+                old_owner, None
+            )
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "match_no": match["match_no"],
+                "old_owner": old_owner,
+                "message": "解锁成功"
+            }
+
+    def transfer_lock(self, match_id: int, from_owner: str, to_owner: str,
+                      reason: str = None) -> Dict:
+        match = self.get_match_by_id(match_id)
+        if not match:
+            raise ValueError(f"匹配记录不存在: {match_id}")
+
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM match_locks WHERE match_id = ?",
+                (match_id,)
+            ).fetchone()
+
+            if not existing:
+                raise ValueError("该记录未被锁定，无法转交")
+
+            if existing["lock_owner"] != from_owner:
+                raise ValueError(
+                    f"当前锁定人是 {existing['lock_owner']}，"
+                    f"不是 {from_owner}，无法转交"
+                )
+
+            conn.execute(
+                "UPDATE match_locks SET lock_owner = ? WHERE match_id = ?",
+                (to_owner, match_id)
+            )
+
+            self._record_lock_history(
+                conn, match_id, LOCK_ACTION_TRANSFER, from_owner, reason,
+                from_owner, to_owner
+            )
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "match_no": match["match_no"],
+                "old_owner": from_owner,
+                "new_owner": to_owner,
+                "message": "转交成功"
+            }
+
+    def takeover_lock(self, match_id: int, operator: str,
+                      reason: str = None) -> Dict:
+        match = self.get_match_by_id(match_id)
+        if not match:
+            raise ValueError(f"匹配记录不存在: {match_id}")
+
+        now = datetime.now()
+
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM match_locks WHERE match_id = ?",
+                (match_id,)
+            ).fetchone()
+
+            if not existing:
+                conn.execute(
+                    """INSERT INTO match_locks
+                       (match_id, lock_owner, lock_reason, locked_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (match_id, operator, reason or "接管未锁定记录",
+                     now.strftime("%Y-%m-%d %H:%M:%S"))
+                )
+                self._record_lock_history(
+                    conn, match_id, LOCK_ACTION_TAKEOVER, operator, reason,
+                    None, operator
+                )
+                return {
+                    "success": True,
+                    "match_id": match_id,
+                    "match_no": match["match_no"],
+                    "old_owner": None,
+                    "new_owner": operator,
+                    "was_expired": False,
+                    "message": "接管成功（原记录未锁定）"
+                }
+
+            old_owner = existing["lock_owner"]
+            is_expired = False
+
+            if existing["lock_expires_at"]:
+                expire_time = datetime.strptime(
+                    existing["lock_expires_at"], "%Y-%m-%d %H:%M:%S"
+                )
+                if expire_time <= now:
+                    is_expired = True
+
+            if not is_expired and old_owner == operator:
+                return {
+                    "success": True,
+                    "already_locked": True,
+                    "match_id": match_id,
+                    "match_no": match["match_no"],
+                    "owner": operator,
+                    "message": "您已锁定该记录"
+                }
+
+            conn.execute(
+                """UPDATE match_locks
+                   SET lock_owner = ?, lock_reason = ?, locked_at = ?,
+                       lock_expires_at = NULL
+                   WHERE match_id = ?""",
+                (operator, reason, now.strftime("%Y-%m-%d %H:%M:%S"), match_id)
+            )
+
+            self._record_lock_history(
+                conn, match_id, LOCK_ACTION_TAKEOVER, operator, reason,
+                old_owner, operator
+            )
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "match_no": match["match_no"],
+                "old_owner": old_owner,
+                "new_owner": operator,
+                "was_expired": is_expired,
+                "message": f"接管成功（原锁定人: {old_owner}）"
+            }
+
+    def force_unlock(self, match_id: int, operator: str,
+                     reason: str = None) -> Dict:
+        match = self.get_match_by_id(match_id)
+        if not match:
+            raise ValueError(f"匹配记录不存在: {match_id}")
+
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT * FROM match_locks WHERE match_id = ?",
+                (match_id,)
+            ).fetchone()
+
+            if not existing:
+                return {
+                    "success": False,
+                    "match_id": match_id,
+                    "match_no": match["match_no"],
+                    "message": "该记录未被锁定"
+                }
+
+            old_owner = existing["lock_owner"]
+
+            conn.execute("DELETE FROM match_locks WHERE match_id = ?", (match_id,))
+
+            self._record_lock_history(
+                conn, match_id, LOCK_ACTION_FORCE_UNLOCK, operator, reason,
+                old_owner, None
+            )
+
+            return {
+                "success": True,
+                "match_id": match_id,
+                "match_no": match["match_no"],
+                "old_owner": old_owner,
+                "message": "强制解锁成功"
+            }
+
+    def batch_force_unlock(self, operator: str, reason: str = None,
+                           owner: str = None) -> Dict:
+        with self._get_conn() as conn:
+            if owner:
+                rows = conn.execute(
+                    "SELECT * FROM match_locks WHERE lock_owner = ?",
+                    (owner,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM match_locks").fetchall()
+
+            if not rows:
+                return {
+                    "success": True,
+                    "count": 0,
+                    "unlocked_count": 0,
+                    "message": "没有需要解锁的记录"
+                }
+
+            count = 0
+            for row in rows:
+                conn.execute(
+                    "DELETE FROM match_locks WHERE match_id = ?",
+                    (row["match_id"],)
+                )
+                self._record_lock_history(
+                    conn, row["match_id"], LOCK_ACTION_FORCE_UNLOCK,
+                    operator, reason, row["lock_owner"], None
+                )
+                count += 1
+
+            return {
+                "success": True,
+                "count": count,
+                "unlocked_count": count,
+                "message": f"批量解锁 {count} 条记录"
+            }
+
+    def get_lock_history(self, match_id: int = None,
+                         operator: str = None,
+                         limit: int = 100) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = "SELECT * FROM lock_history WHERE 1=1"
+            params = []
+            if match_id:
+                sql += " AND match_id = ?"
+                params.append(match_id)
+            if operator:
+                sql += " AND operator = ?"
+                params.append(operator)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def _record_lock_history(self, conn, match_id: int, action: str,
+                             operator: str, reason: str,
+                             old_owner: str, new_owner: str) -> None:
+        conn.execute(
+            """INSERT INTO lock_history
+               (match_id, action, operator, reason, old_owner, new_owner)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (match_id, action, operator, reason, old_owner, new_owner)
+        )
+
+    def is_match_locked_by_other(self, match_id: int, operator: str) -> bool:
+        lock = self.get_match_lock(match_id)
+        if not lock:
+            return False
+        if lock["lock_owner"] == operator:
+            return False
+        if lock.get("lock_expires_at"):
+            expire_time = datetime.strptime(
+                lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S"
+            )
+            if expire_time <= datetime.now():
+                return False
+        return True
+
+    def get_matches_with_lock_info(self, status: str = None,
+                                    owner: str = None) -> List[Dict]:
+        matches = self.get_matches_by_status(status)
+        if not matches:
+            return []
+
+        result = []
+        for m in matches:
+            lock = self.get_match_lock(m["id"])
+            m_with_lock = dict(m)
+            if lock:
+                m_with_lock["current_owner"] = lock["lock_owner"]
+                m_with_lock["lock_reason"] = lock["lock_reason"]
+                m_with_lock["locked_at"] = lock["locked_at"]
+                m_with_lock["lock_expires_at"] = lock["lock_expires_at"]
+                m_with_lock["is_locked"] = True
+                m_with_lock["is_lock_expired"] = False
+                if lock.get("lock_expires_at"):
+                    expire_time = datetime.strptime(
+                        lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S"
+                    )
+                    m_with_lock["is_lock_expired"] = expire_time <= datetime.now()
+            else:
+                m_with_lock["current_owner"] = None
+                m_with_lock["lock_reason"] = None
+                m_with_lock["locked_at"] = None
+                m_with_lock["lock_expires_at"] = None
+                m_with_lock["is_locked"] = False
+                m_with_lock["is_lock_expired"] = False
+
+            if owner and m_with_lock.get("current_owner") != owner:
+                continue
+
+            result.append(m_with_lock)
+
+        return result
+
+    def get_match_with_lock_by_id(self, match_id: int) -> Optional[Dict]:
+        match = self.get_match_by_id(match_id)
+        if not match:
+            return None
+
+        lock = self.get_match_lock(match_id)
+        if lock:
+            match["current_owner"] = lock["lock_owner"]
+            match["lock_reason"] = lock["lock_reason"]
+            match["locked_at"] = lock["locked_at"]
+            match["lock_expires_at"] = lock["lock_expires_at"]
+            match["is_locked"] = True
+            if lock.get("lock_expires_at"):
+                expire_time = datetime.strptime(
+                    lock["lock_expires_at"], "%Y-%m-%d %H:%M:%S"
+                )
+                match["is_lock_expired"] = expire_time <= datetime.now()
+            else:
+                match["is_lock_expired"] = False
+        else:
+            match["current_owner"] = None
+            match["lock_reason"] = None
+            match["locked_at"] = None
+            match["lock_expires_at"] = None
+            match["is_locked"] = False
+            match["is_lock_expired"] = False
+
+        return match
