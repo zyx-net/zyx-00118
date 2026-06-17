@@ -1,5 +1,6 @@
 import os
 import sys
+import io
 import json
 import csv
 import tempfile
@@ -8,6 +9,13 @@ import shutil
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from click.testing import CliRunner
+    from click.testing import Result as ClickResult
+    HAS_CLICK = True
+except ImportError:
+    HAS_CLICK = False
 
 from invoice_reconciler.core.config import Config
 from invoice_reconciler.core.database import (
@@ -872,6 +880,209 @@ class TestChangeTrackingFullWorkflow(unittest.TestCase):
             pay2["batch_id"], "exporter", format="json"
         )
         self.assertTrue(pay_export["success"])
+
+
+@unittest.skipUnless(HAS_CLICK, "Click is required for CLI tests")
+class TestBatchChangesCLIEntrypoints(unittest.TestCase):
+    """batch changes 命令的 CLI 入口回归测试，覆盖不带参数和带 batch_id 两种情况"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+
+        self._setup_data()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _setup_data(self):
+        db = Database(self.db_path)
+        workflow = WorkflowManager(self.config, db)
+        importer = CSVImporter(self.config, db)
+        matcher = MatchEngine(self.config, db, workflow)
+
+        importer.import_invoices(self.invoice_v1, "op_a")
+        importer.import_payments(self.payment_v1, "op_a")
+        matcher.run_auto_matching("op_a")
+        inv2 = importer.import_invoices(self.invoice_v2, "op_b")
+        self.batch_2_id = inv2["batch_id"]
+
+        del db
+        del workflow
+        del importer
+        del matcher
+
+    def _run_cli(self, args):
+        from invoice_reconciler.cli.main import cli
+        try:
+            runner = CliRunner(mix_stderr=False)
+        except TypeError:
+            runner = CliRunner()
+        result = runner.invoke(
+            cli,
+            ["--config", self._write_config()] + args,
+            catch_exceptions=False,
+        )
+        return result
+
+    def _write_config(self):
+        config_path = os.path.join(self.test_dir, "config.yaml")
+        import yaml
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump({
+                "amount_tolerance": 0.01,
+                "date_window_days": 30,
+                "invoice_required_columns": [
+                    "invoice_no", "invoice_date", "customer", "amount", "status"
+                ],
+                "payment_required_columns": [
+                    "payment_no", "payment_date", "customer", "amount"
+                ],
+                "export_format": "xlsx",
+                "db_path": self.db_path,
+                "export_dir": self.export_dir,
+                "lock_timeout_seconds": 3600,
+                "default_user_role": "reviewer",
+                "admin_users": ["admin"],
+                "enable_lock": False,
+            }, f)
+        return config_path
+
+    def test_batch_changes_without_batch_id_no_crash(self):
+        """不带 batch_id 执行 batch changes 不应崩溃（稳定复现旧的 UnboundLocalError）"""
+        result = self._run_cli(["batch", "changes"])
+
+        self.assertNotIn(
+            "UnboundLocalError", result.output + (result.stderr or ""),
+            f"不应出现未绑定变量错误，输出: {result.output}"
+        )
+        self.assertNotEqual(
+            result.exit_code, 2,
+            f"不应因参数使用错误崩溃 (exit_code=2)，stderr: {result.stderr}"
+        )
+
+        self.assertIn("变更记录", result.output)
+        self.assertIn("变更统计", result.output)
+
+    def test_batch_changes_with_batch_id_works(self):
+        """带 batch_id 执行 batch changes 正常工作"""
+        result = self._run_cli(["batch", "changes", "--batch-id", str(self.batch_2_id)])
+
+        self.assertEqual(result.exit_code, 0, f"stderr: {result.stderr}")
+        self.assertIn(str(self.batch_2_id), result.output)
+        self.assertIn("变更记录", result.output)
+        self.assertIn("INV002", result.output)
+
+    def test_batch_changes_two_entries_context_not_polluted(self):
+        """不带参数 -> 带参数 -> 不带参数 查看上下文互不污染"""
+        db = Database(self.db_path)
+        workbench = BatchWorkbench(self.config, db)
+        workbench.clear_workbench_state()
+
+        result1 = self._run_cli(["batch", "changes"])
+        self.assertEqual(result1.exit_code, 0, f"stderr: {result1.stderr}")
+
+        ctx1 = workbench.get_last_change_view_context()
+        self.assertIsNotNone(ctx1, "不带 batch_id 也应保存查看上下文")
+        self.assertIsNone(ctx1.get("batch_id"), "上下文的 batch_id 应为 None 表示全部批次")
+
+        result2 = self._run_cli(["batch", "changes", "--batch-id", str(self.batch_2_id)])
+        self.assertEqual(result2.exit_code, 0, f"stderr: {result2.stderr}")
+
+        ctx2 = workbench.get_last_change_view_context()
+        self.assertIsNotNone(ctx2)
+        self.assertEqual(ctx2.get("batch_id"), self.batch_2_id,
+                          "带 batch_id 后上下文应记录具体批次号")
+
+        result3 = self._run_cli(["batch", "changes"])
+        self.assertEqual(result3.exit_code, 0, f"stderr: {result3.stderr}")
+
+        ctx3 = workbench.get_last_change_view_context()
+        self.assertIsNotNone(ctx3)
+        self.assertIsNone(ctx3.get("batch_id"),
+                          "再次不带 batch_id 应重新将上下文设为全部批次，不应被上次污染")
+
+        del db
+
+    def test_batch_changes_view_filter_persists(self):
+        """batch changes 的过滤条件应被持久化，下次重启能恢复"""
+        db = Database(self.db_path)
+        workbench = BatchWorkbench(self.config, db)
+        workbench.clear_workbench_state()
+
+        self._run_cli([
+            "batch", "changes",
+            "--change-type", "amount_change",
+            "--impact-type", "critical",
+            "--status", "pending",
+        ])
+
+        ctx = workbench.get_last_change_view_context()
+        self.assertIsNotNone(ctx)
+        self.assertEqual(ctx.get("change_type"), "amount_change")
+        self.assertEqual(ctx.get("impact_type"), "critical")
+        self.assertEqual(ctx.get("processing_status"), "pending")
+        self.assertIsNone(ctx.get("batch_id"))
+
+        self._run_cli(["batch", "changes", "--batch-id", str(self.batch_2_id)])
+        ctx_after = workbench.get_last_change_view_context()
+        self.assertEqual(ctx_after.get("batch_id"), self.batch_2_id)
+        self.assertIsNone(ctx_after.get("change_type"),
+                        "切换到带 batch_id 时不应该保留之前的过滤条件（用户已明确指定了新范围）")
+        self.assertIsNone(ctx_after.get("impact_type"))
+        self.assertIsNone(ctx_after.get("processing_status"))
+
+        del db
+
+    def test_resume_after_changes_then_export(self):
+        """先 batch changes（不带参数），然后 export-changes，再重启 batch changes 能恢复"""
+        db = Database(self.db_path)
+        workbench = BatchWorkbench(self.config, db)
+        workbench.clear_workbench_state()
+
+        result_view = self._run_cli(["batch", "changes"])
+        self.assertEqual(result_view.exit_code, 0)
+
+        result_export = self._run_cli([
+            "batch", "export-changes", str(self.batch_2_id),
+            "--format", "json",
+        ])
+        self.assertEqual(result_export.exit_code, 0, f"stderr: {result_export.stderr}")
+        self.assertIn("变更日志已导出", result_export.output)
+
+        export_ctx = workbench.get_last_export_context()
+        self.assertIsNotNone(export_ctx)
+        self.assertEqual(export_ctx.get("batch_id"), self.batch_2_id)
+        self.assertEqual(export_ctx.get("format"), "json")
+
+        result_view2 = self._run_cli(["batch", "changes"])
+        self.assertEqual(result_view2.exit_code, 0)
+
+        self.assertIn("会话恢复", result_view2.output)
+        self.assertIn("导出", result_view2.output)
+        self.assertIn("上次查看变更", result_view2.output)
+
+        del db
 
 
 if __name__ == "__main__":

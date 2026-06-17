@@ -134,6 +134,8 @@ def cli(ctx, config_path):
             parts = []
             if last_view.get("batch_id"):
                 parts.append(f"批次 #{last_view['batch_id']}")
+            else:
+                parts.append("全部批次")
             if last_view.get("change_type"):
                 ct_label = CHANGE_TYPE_LABELS.get(last_view['change_type'], last_view['change_type'])
                 parts.append(f"变更类型: {ct_label}")
@@ -1834,9 +1836,9 @@ def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, re
     """查看批次变更日志明细"""
     tracker = ctx.obj["change_tracker"]
     db = ctx.obj["db"]
+    workbench = ctx.obj["workbench"]
 
     if batch_id:
-        workbench = ctx.obj["workbench"]
         workbench.save_last_selected_batch(batch_id, get_current_user())
 
     workbench.save_change_view_context(
