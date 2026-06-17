@@ -1,0 +1,6 @@
+invoice_no,invoice_date,customer,amount,status
+REV001,2024-01-10,Acme Ltd,100.00,normal
+REV002,2024-01-11,Beta Ltd,250.00,normal
+REV003,2024-01-12,Gamma Ltd,300.00,invalid
+REV004,2024-01-13,NoPay Ltd,400.00,normal
+REV006,2024-01-16,StatusCo Ltd,600.00,normal

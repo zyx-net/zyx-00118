@@ -516,6 +516,17 @@ class ReportExporter:
 
         conflicts = []
         for c in raw_conflicts:
+            old_amount = c.get("old_amount")
+            new_amount = c.get("new_amount")
+            try:
+                old_amount_str = f"{float(old_amount):.2f}" if old_amount is not None and old_amount != "-" else "-"
+            except (ValueError, TypeError):
+                old_amount_str = str(old_amount) if old_amount is not None else "-"
+            try:
+                new_amount_str = f"{float(new_amount):.2f}" if new_amount is not None and new_amount != "-" else "-"
+            except (ValueError, TypeError):
+                new_amount_str = str(new_amount) if new_amount is not None else "-"
+
             conflicts.append({
                 "冲突ID": c.get("conflict_id", ""),
                 "批次ID": batch_id,
@@ -527,8 +538,8 @@ class ReportExporter:
                 "新状态": c.get("new_status", "-"),
                 "原操作人": c.get("old_operator", "-"),
                 "新操作人": c.get("new_operator", "-"),
-                "原金额": f"{c['old_amount']:.2f}" if c.get("old_amount") is not None else "-",
-                "新金额": f"{c['new_amount']:.2f}" if c.get("new_amount") is not None else "-",
+                "原金额": old_amount_str,
+                "新金额": new_amount_str,
                 "冲突原因": c.get("conflict_reason", ""),
                 "检测时间": c.get("detected_at", ""),
             })

@@ -55,16 +55,14 @@ class BatchWorkbench:
 
             total_processed = (
                 (summary["confirmed_matches"] or 0) +
-                (summary["matched_invoices"] or 0) +
-                (summary["matched_payments"] or 0)
+                (summary["exception_matches"] or 0) +
+                (summary["revoked_matches"] or 0)
             )
             total_tasks = (
                 (summary["pending_matches"] or 0) +
                 (summary["confirmed_matches"] or 0) +
                 (summary["exception_matches"] or 0) +
                 (summary["revoked_matches"] or 0) +
-                (summary["matched_invoices"] or 0) +
-                (summary["matched_payments"] or 0) +
                 (summary["unmatched_invoices"] or 0) +
                 (summary["unmatched_payments"] or 0)
             )
@@ -309,7 +307,9 @@ class BatchWorkbench:
         result = {
             "success": True,
             "restored": False,
+            "has_state": False,
             "last_batch": None,
+            "last_batch_id": None,
             "filters": filters,
             "last_access_time": last_access,
         }
@@ -319,6 +319,8 @@ class BatchWorkbench:
             batch_info = self.db.get_batch(batch_id)
             if batch_info:
                 result["restored"] = True
+                result["has_state"] = True
+                result["last_batch_id"] = batch_id
                 result["last_batch"] = {
                     "batch_id": batch_id,
                     "file_name": batch_info["file_name"],

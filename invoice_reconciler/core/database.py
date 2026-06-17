@@ -1561,39 +1561,79 @@ class Database:
 
     def get_batch_summary(self, batch_id: int = None) -> List[Dict]:
         with self._get_conn() as conn:
-            sql = """
-                SELECT
-                    b.id as batch_id,
-                    b.file_type,
-                    b.file_name,
-                    b.total_rows,
-                    b.success_rows,
-                    b.failed_rows,
-                    b.operator,
-                    b.imported_at,
-                    COUNT(DISTINCT CASE WHEN i.match_status = 'matched' THEN i.id END) as matched_invoices,
-                    COUNT(DISTINCT CASE WHEN i.match_status = 'unmatched' AND i.status = 'normal' THEN i.id END) as unmatched_invoices,
-                    COUNT(DISTINCT CASE WHEN p.match_status = 'matched' THEN p.id END) as matched_payments,
-                    COUNT(DISTINCT CASE WHEN p.match_status = 'unmatched' AND p.status = 'normal' THEN p.id END) as unmatched_payments,
-                    COUNT(DISTINCT CASE WHEN m.status = 'pending' THEN m.id END) as pending_matches,
-                    COUNT(DISTINCT CASE WHEN m.status = 'matched' THEN m.id END) as confirmed_matches,
-                    COUNT(DISTINCT CASE WHEN m.status = 'exception' THEN m.id END) as exception_matches,
-                    COUNT(DISTINCT CASE WHEN m.status = 'revoked' THEN m.id END) as revoked_matches,
-                    COUNT(DISTINCT bc.id) as conflict_count
-                FROM import_batches b
-                LEFT JOIN invoices i ON i.batch_id = b.id
-                LEFT JOIN payments p ON p.batch_id = b.id
-                LEFT JOIN matches m ON m.invoice_id = i.id OR m.payment_id = p.id
-                LEFT JOIN batch_conflicts bc ON bc.batch_id = b.id
-            """
+            batches_sql = "SELECT * FROM import_batches"
             params = ()
             if batch_id:
-                sql += " WHERE b.id = ?"
+                batches_sql += " WHERE id = ?"
                 params = (batch_id,)
-            sql += " GROUP BY b.id ORDER BY b.imported_at DESC"
+            batches_sql += " ORDER BY imported_at DESC"
 
-            rows = conn.execute(sql, params).fetchall()
-            return [dict(r) for r in rows]
+            batch_rows = conn.execute(batches_sql, params).fetchall()
+            if not batch_rows:
+                return []
+
+            result = []
+            for b in batch_rows:
+                batch = dict(b)
+                batch_id_val = batch["id"]
+                file_type = batch["file_type"]
+
+                inv_stats = conn.execute(
+                    """SELECT
+                        COUNT(DISTINCT CASE WHEN match_status = 'matched' THEN id END) as matched_invoices,
+                        COUNT(DISTINCT CASE WHEN match_status = 'unmatched' AND status = 'normal' THEN id END) as unmatched_invoices
+                       FROM invoices WHERE batch_id = ?""",
+                    (batch_id_val,)
+                ).fetchone()
+
+                pay_stats = conn.execute(
+                    """SELECT
+                        COUNT(DISTINCT CASE WHEN match_status = 'matched' THEN id END) as matched_payments,
+                        COUNT(DISTINCT CASE WHEN match_status = 'unmatched' AND status = 'normal' THEN id END) as unmatched_payments
+                       FROM payments WHERE batch_id = ?""",
+                    (batch_id_val,)
+                ).fetchone()
+
+                match_stats = conn.execute(
+                    """SELECT
+                        COUNT(DISTINCT CASE WHEN m.status = 'pending' THEN m.id END) as pending_matches,
+                        COUNT(DISTINCT CASE WHEN m.status = 'matched' THEN m.id END) as confirmed_matches,
+                        COUNT(DISTINCT CASE WHEN m.status = 'exception' THEN m.id END) as exception_matches,
+                        COUNT(DISTINCT CASE WHEN m.status = 'revoked' THEN m.id END) as revoked_matches
+                       FROM matches m
+                       JOIN invoices i ON m.invoice_id = i.id
+                       JOIN payments p ON m.payment_id = p.id
+                       WHERE i.batch_id = ? OR p.batch_id = ?""",
+                    (batch_id_val, batch_id_val)
+                ).fetchone()
+
+                conflict_count = conn.execute(
+                    "SELECT COUNT(*) FROM batch_conflicts WHERE batch_id = ?",
+                    (batch_id_val,)
+                ).fetchone()[0]
+
+                summary = {
+                    "batch_id": batch_id_val,
+                    "file_type": file_type,
+                    "file_name": batch["file_name"],
+                    "total_rows": batch["total_rows"],
+                    "success_rows": batch["success_rows"],
+                    "failed_rows": batch["failed_rows"],
+                    "operator": batch["operator"],
+                    "imported_at": batch["imported_at"],
+                    "matched_invoices": inv_stats["matched_invoices"] or 0,
+                    "unmatched_invoices": inv_stats["unmatched_invoices"] or 0,
+                    "matched_payments": pay_stats["matched_payments"] or 0,
+                    "unmatched_payments": pay_stats["unmatched_payments"] or 0,
+                    "pending_matches": match_stats["pending_matches"] or 0,
+                    "confirmed_matches": match_stats["confirmed_matches"] or 0,
+                    "exception_matches": match_stats["exception_matches"] or 0,
+                    "revoked_matches": match_stats["revoked_matches"] or 0,
+                    "conflict_count": conflict_count or 0,
+                }
+                result.append(summary)
+
+            return result
 
     def get_matches_by_batch(self, batch_id: int, status: str = None,
                              operator: str = None) -> List[Dict]:

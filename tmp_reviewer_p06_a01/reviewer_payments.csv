@@ -1,0 +1,5 @@
+payment_no,payment_date,customer,amount
+PAY001,2024-01-10,Acme Ltd,100.00
+PAY002,2024-01-11,Beta Ltd,200.00
+PAY003,2024-01-12,Gamma Ltd,300.00
+PAY004,2024-01-14,ExtraPay Ltd,999.00

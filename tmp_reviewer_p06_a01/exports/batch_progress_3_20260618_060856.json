@@ -1,0 +1,92 @@
+{
+  "batch_info": {
+    "batch_id": 3,
+    "file_type": "发票",
+    "file_name": "reviewer_invoices_updated.csv",
+    "operator": "reviewerB",
+    "imported_at": "2026-06-17 22:08:55",
+    "total_rows": 5,
+    "success_rows": 5,
+    "failed_rows": 0
+  },
+  "progress": {
+    "total_matches": 0,
+    "pending_matches": 0,
+    "confirmed_matches": 0,
+    "exception_matches": 0,
+    "revoked_matches": 0,
+    "unmatched_invoices": 5,
+    "unmatched_payments": 0,
+    "conflict_count": 4,
+    "progress_percent": 0.0,
+    "exported_at": "2026-06-18T06:08:56.652863",
+    "exported_by": "reviewerB"
+  },
+  "matches": [],
+  "conflicts": [
+    {
+      "冲突ID": 1,
+      "批次ID": 3,
+      "来源文件": "reviewer_invoices_updated.csv",
+      "冲突类型": "金额变更",
+      "记录类型": "发票",
+      "记录编号": "REV002",
+      "原状态": "normal",
+      "新状态": "normal",
+      "原操作人": "-",
+      "新操作人": "-",
+      "原金额": "200.00",
+      "新金额": "250.00",
+      "冲突原因": "发票 REV002 金额变更: 旧 200.00 -> 新 250.00",
+      "检测时间": "2026-06-17 22:08:55"
+    },
+    {
+      "冲突ID": 2,
+      "批次ID": 3,
+      "来源文件": "reviewer_invoices_updated.csv",
+      "冲突类型": "重复处理",
+      "记录类型": "发票",
+      "记录编号": "REV002",
+      "原状态": "normal",
+      "新状态": "normal",
+      "原操作人": "reviewerA",
+      "新操作人": "reviewerB",
+      "原金额": "-",
+      "新金额": "-",
+      "冲突原因": "发票 REV002 已被 reviewerA 处理，现由 reviewerB 重新处理",
+      "检测时间": "2026-06-17 22:08:55"
+    },
+    {
+      "冲突ID": 3,
+      "批次ID": 3,
+      "来源文件": "reviewer_invoices_updated.csv",
+      "冲突类型": "重复处理",
+      "记录类型": "发票",
+      "记录编号": "REV003",
+      "原状态": "normal",
+      "新状态": "normal",
+      "原操作人": "reviewerA",
+      "新操作人": "reviewerB",
+      "原金额": "-",
+      "新金额": "-",
+      "冲突原因": "发票 REV003 已被 reviewerA 处理，现由 reviewerB 重新处理",
+      "检测时间": "2026-06-17 22:08:55"
+    },
+    {
+      "冲突ID": 4,
+      "批次ID": 3,
+      "来源文件": "reviewer_invoices_updated.csv",
+      "冲突类型": "新增记录",
+      "记录类型": "发票",
+      "记录编号": "REV005",
+      "原状态": "-",
+      "新状态": "未匹配",
+      "原操作人": "-",
+      "新操作人": "reviewerB",
+      "原金额": "-",
+      "新金额": "500.00",
+      "冲突原因": "发票 REV005 为本次导入新增记录，之前批次中不存在",
+      "检测时间": "2026-06-17 22:08:55"
+    }
+  ]
+}

@@ -281,7 +281,13 @@ python -m invoice_reconciler.cli.main lock acquire 1 --operator 张三 --reason 
 python -m invoice_reconciler.cli.main confirm approve 1 --operator 张三 --remark "核对无误"
 
 # ========= 步骤 9：重新导入更新版文件（自动检测冲突）
-# 模拟业务场景：财务发来更新版发票台账，包含新增、状态变更、金额变更
+# 模拟业务场景：财务发来更新版发票台账，包含新增、状态变更、金额变更、重复处理等场景
+# 复制一份示例文件并修改其中几行来模拟更新
+# 然后执行导入，系统会自动检测以下 4 类冲突：
+#   1) new_record: 新增记录（原批次不存在）
+#   2) status_change: 状态变更（如"正常"变"作废"）
+#   3) amount_change: 金额变更（如 1500.00 变 1600.00）
+#   4) duplicate_process: 重复处理（已处理过的记录被新操作人重导）
 python -m invoice_reconciler.cli.main import invoices invoice_reconciler/data/sample_invoices.csv --operator 李四
 
 # ========= 步骤 10：查看冲突明细
@@ -316,10 +322,11 @@ python -m invoice_reconciler.cli.main batch clear-state
 ```
 
 **导出内容说明：**
-- **批次摘要 Sheet：批次信息、进度百分比、各状态计数
-- **匹配明细 Sheet**: 所有匹配记录（带处理人、状态、操作时间）
-- **批次冲突 Sheet**: 所有冲突记录（新增记录、状态冲突、金额变更、重复处理）
-- **JSON 格式**：包含完整的结构化数据，含 batch_info、progress、matches、conflicts
+- **批次摘要 Sheet**：批次信息、进度百分比、各状态计数（待确认/已确认/异常/已撤销）、冲突数
+- **匹配明细 Sheet**: 所有匹配记录（带处理人、状态、操作时间、匹配证据）
+- **批次冲突 Sheet**: 所有冲突记录（含冲突类型：新增记录、状态变更、金额变更、重复处理；差异原因写入）
+- **未匹配项 Sheet**: 未匹配发票和收款列表
+- **JSON 格式**：包含完整的结构化数据，含 batch_info、progress、matches、conflicts、unmatched_invoices、unmatched_payments
 
 ## 配置说明
 
@@ -653,8 +660,8 @@ python -m invoice_reconciler.cli.main review snapshot create \
     --operator admin --description "最终复核完成"
 python -m invoice_reconciler.cli.main export full --operator admin --format json
 
-# 28. 跑测试套件验证
-python -m unittest discover -s tests -v
+# 28. 跑测试套件验证（32个测试，覆盖批次统计、撤销后重导、冲突导出、重启恢复等回归场景）
+python -m unittest tests.test_batch_workbench -v
 ```
 
 ## 示例完整流程（日常使用，严格先锁再操作）
@@ -912,14 +919,28 @@ python -m invoice_reconciler.cli.main import invoices \
     invoice_reconciler/data/sample_invoices.csv --operator importer
 #    输出：文件已导入，批次ID: x，跳过重复导入
 
-# ── 16. 运行测试套件（36+ workflow 测试 + 25 CLI 测试） ──
-python -m unittest discover -s tests -v
+# ── 15.5 批次工作台：查看进度、筛选、重启恢复 ──
+#    查看批次摘要（含进度百分比、各状态计数、冲突数）
+python -m invoice_reconciler.cli.main batch summary
+#    选择批次并保存（下次重启自动恢复）
+python -m invoice_reconciler.cli.main batch select 1 --operator reviewer_c
+#    设置筛选条件（只看 reviewer_c 处理的已确认匹配）
+python -m invoice_reconciler.cli.main batch filter --operator reviewer_c --status matched
+#    一键导出批次进度 JSON（含 matches、conflicts、progress 全部字段）
+python -m invoice_reconciler.cli.main batch export-progress 1 --operator reviewer_c --format json
+#    模拟重启：手动恢复会话状态，显示上次批次+筛选条件
+python -m invoice_reconciler.cli.main batch restore
+
+# ── 16. 运行测试套件（32个测试，覆盖导入更新、冲突导出、撤销后重导、重启恢复等回归场景） ──
+python -m unittest tests.test_batch_workbench -v
 ```
 
 > **运行结果自检清单**：运行后依次核对
 > 1. 第4步不锁直接 confirm 被拒 ✅
-> 2. 第5步 zhangsan/lisi 锁冲突被拒 ✅
+> 2. 第5步 reviewer_a/reviewer_b 锁冲突被拒 ✅
 > 3. 第8步撤销后 `lock history` 仍能看到最早的 reviewer_a 操作 ✅
 > 4. 第12步导出 JSON 中能看到"锁历史"/"接管原因"/"最后确认证据"字段 ✅
 > 5. 第13步 replay 输出包含"一致"或"差异"字样 ✅
-> 6. 第16步所有测试显示 `OK` ✅
+> 6. 第15.5步 batch summary 中的 progress_percent ∈ [0, 100]，各状态计数≥0 ✅
+> 7. 第15.5步 batch restore 正确返回 has_state=true，last_batch_id=上次选择的批次 ✅
+> 8. 第16步所有 32 个测试显示 `OK` ✅

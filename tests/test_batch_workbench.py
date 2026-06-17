@@ -847,9 +847,433 @@ class TestBatchWorkbenchSummary(unittest.TestCase):
 
         total = batch["total_tasks"]
         if total > 0:
-            completed = batch["confirmed_matches"] + batch["matched_invoices"] + batch["matched_payments"]
-            expected_progress = (completed / total) * 100 if total > 0 else 100
+            completed = (
+                batch["confirmed_matches"] +
+                batch["exception_matches"] +
+                batch["revoked_matches"]
+            )
+            expected_progress = (completed / total) * 100 if total > 0 else 100.0
             self.assertAlmostEqual(batch["progress_percent"], expected_progress, places=1)
+
+
+SAMPLE_INVOICES_UPDATED_CSV = """invoice_no,invoice_date,customer,amount,status
+INV001,2024-01-15,北京科技有限公司,1000.00,正常
+INV002,2024-01-16,上海贸易公司,2500.50,作废
+INV003,2024-01-17,广州电子厂,3000.00,正常
+INV004,2024-01-18,深圳软件公司,1600.00,正常
+INV005,2024-01-19,杭州电商平台,800.00,正常
+INV006,2024-01-20,武汉科技公司,2000.00,正常
+"""
+
+
+class TestBatchWorkbenchRegressionImportUpdate(unittest.TestCase):
+    """导入更新回归测试：二次导入检测到各类冲突"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        self.invoice_updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+        with open(self.invoice_updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+
+        self.db = Database(self.db_path)
+        self.workbench = BatchWorkbench(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, None)
+        self.exporter = ReportExporter(self.config, self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_import_update_conflict_detection(self):
+        """测试二次导入更新检测到全部冲突类型"""
+        inv1 = self.importer.import_invoices(self.invoice_csv, "operator_a")
+        self.importer.import_payments(self.payment_csv, "operator_a")
+        inv_batch1 = inv1["batch_id"]
+
+        self.matcher.run_auto_matching("operator_a")
+
+        inv2 = self.importer.import_invoices(self.invoice_updated_csv, "operator_b")
+        conflicts = inv2.get("conflicts", [])
+
+        conflict_types = set(c["conflict_type"] for c in conflicts)
+        self.assertIn("new_record", conflict_types, "应检测到新增记录冲突")
+        self.assertIn("status_change", conflict_types, "应检测到状态变更冲突")
+        self.assertIn("amount_change", conflict_types, "应检测到金额变更冲突")
+        self.assertIn("duplicate_process", conflict_types, "应检测到重复处理冲突")
+
+        for c in conflicts:
+            self.assertTrue(c.get("conflict_reason"), "每个冲突都必须有冲突原因")
+            self.assertTrue(len(c["conflict_reason"]) > 0, "冲突原因不能为空")
+
+        summary = self.workbench.get_batch_workbench_summary(inv2["batch_id"])
+        self.assertEqual(len(summary["batches"]), 1)
+        batch = summary["batches"][0]
+        self.assertEqual(batch["conflict_count"], len(conflicts),
+                         "工作台冲突计数应与实际冲突数一致")
+
+
+class TestBatchWorkbenchRegressionConflictExport(unittest.TestCase):
+    """冲突导出回归测试：冲突场景下导出不崩溃、原因写入"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        self.invoice_updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+        with open(self.invoice_updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+
+        self.db = Database(self.db_path)
+        self.workbench = BatchWorkbench(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, None)
+        self.exporter = ReportExporter(self.config, self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_conflict_json_export_no_crash(self):
+        """测试冲突批次JSON导出不崩溃"""
+        inv1 = self.importer.import_invoices(self.invoice_csv, "operator_a")
+        self.importer.import_payments(self.payment_csv, "operator_a")
+        inv_batch1 = inv1["batch_id"]
+        self.matcher.run_auto_matching("operator_a")
+
+        inv2 = self.importer.import_invoices(self.invoice_updated_csv, "operator_b")
+        inv_batch2 = inv2["batch_id"]
+
+        json_result = self.exporter.export_batch_progress(
+            inv_batch2, "test_user", format="json"
+        )
+        self.assertTrue(json_result["success"], "JSON导出应成功")
+        self.assertTrue(os.path.exists(json_result["file_path"]))
+
+        with open(json_result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertIn("conflicts", data)
+        self.assertEqual(len(data["conflicts"]), len(inv2.get("conflicts", [])))
+
+        required_fields = [
+            "冲突ID", "批次ID", "来源文件", "冲突类型", "记录类型",
+            "记录编号", "原状态", "新状态", "原操作人", "新操作人",
+            "原金额", "新金额", "冲突原因", "检测时间"
+        ]
+        for c in data["conflicts"]:
+            for field in required_fields:
+                self.assertIn(field, c, f"JSON冲突记录缺少字段: {field}")
+            self.assertTrue(c.get("冲突原因"), "冲突原因不能为空")
+
+    def test_conflict_csv_export_no_crash(self):
+        """测试冲突批次CSV导出不崩溃"""
+        inv1 = self.importer.import_invoices(self.invoice_csv, "operator_a")
+        self.importer.import_payments(self.payment_csv, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+
+        inv2 = self.importer.import_invoices(self.invoice_updated_csv, "operator_b")
+        inv_batch2 = inv2["batch_id"]
+
+        csv_result = self.exporter.export_batch_progress(
+            inv_batch2, "test_user", format="csv"
+        )
+        self.assertTrue(csv_result["success"], "CSV导出应成功")
+        self.assertTrue(os.path.isdir(csv_result["file_path"]))
+
+        conflicts_csv = os.path.join(csv_result["file_path"], "批次冲突.csv")
+        self.assertTrue(os.path.exists(conflicts_csv), "批次冲突.csv应存在")
+
+        with open(conflicts_csv, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        self.assertGreater(len(rows), 0, "CSV中应有冲突记录")
+        for r in rows:
+            if r.get("冲突ID"):
+                self.assertTrue(r.get("冲突原因"), "CSV冲突记录应有冲突原因")
+
+    def test_full_report_includes_conflicts(self):
+        """测试完整报告导出包含冲突数据"""
+        self.importer.import_invoices(self.invoice_csv, "operator_a")
+        self.importer.import_payments(self.payment_csv, "operator_a")
+        self.matcher.run_auto_matching("operator_a")
+        self.importer.import_invoices(self.invoice_updated_csv, "operator_b")
+
+        full_result = self.exporter.export_full_report("test_user", format="json")
+        self.assertTrue(full_result["success"])
+        self.assertTrue(os.path.exists(full_result["file_path"]))
+
+        with open(full_result["file_path"], "r", encoding="utf-8") as f:
+            full_data = json.load(f)
+
+        self.assertIn("批次冲突", full_data, "完整报告应包含批次冲突")
+        self.assertGreater(len(full_data["批次冲突"]), 0, "完整报告中冲突数应大于0")
+        self.assertEqual(
+            full_result["summary"]["conflicts_count"],
+            len(full_data["批次冲突"]),
+            "摘要冲突计数与实际冲突数应一致"
+        )
+
+
+class TestBatchWorkbenchRegressionUndoReExport(unittest.TestCase):
+    """撤销后重导回归测试：撤销后导出进度正确同步"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+        self.db = Database(self.db_path)
+        self.workbench = BatchWorkbench(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, None)
+        self.revoker = Revoker(self.db, self.config, None)
+        self.exporter = ReportExporter(self.config, self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_revoke_syncs_to_export_progress(self):
+        """测试撤销操作后，confirmed减少 revoked增加，进度同步"""
+        inv1 = self.importer.import_invoices(self.invoice_csv, "operator_a")
+        self.importer.import_payments(self.payment_csv, "operator_a")
+        inv_batch_id = inv1["batch_id"]
+
+        self.matcher.run_auto_matching("operator_a")
+
+        # 将自动精确匹配(matched)改为可确认的pending状态，再确认
+        with self.db._get_conn() as conn:
+            all_matches = conn.execute(
+                "SELECT m.* FROM matches m JOIN invoices i ON m.invoice_id = i.id "
+                "WHERE i.batch_id = ?", (inv_batch_id,)
+            ).fetchall()
+            all_match_ids = [m["id"] for m in all_matches]
+
+            for mid in all_match_ids:
+                conn.execute(
+                    "UPDATE matches SET status = ?, confirmed_at = NULL WHERE id = ?",
+                    (MATCH_STATUS_PENDING, mid)
+                )
+                m = conn.execute("SELECT * FROM matches WHERE id = ?", (mid,)).fetchone()
+                conn.execute(
+                    "UPDATE invoices SET match_status = ? WHERE id = ?",
+                    (MATCH_STATUS_PENDING, m["invoice_id"])
+                )
+                conn.execute(
+                    "UPDATE payments SET match_status = ? WHERE id = ?",
+                    (MATCH_STATUS_PENDING, m["payment_id"])
+                )
+
+        # 确认所有pending匹配
+        confirmed_count = 0
+        for mid in all_match_ids:
+            try:
+                self.matcher.confirm_match(mid, "operator_a", "确认")
+                confirmed_count += 1
+            except Exception:
+                pass
+
+        self.assertGreater(confirmed_count, 0, "至少应确认1条匹配")
+
+        # 第一次导出
+        exp1 = self.exporter.export_batch_progress(inv_batch_id, "u1", format="json")
+        with open(exp1["file_path"], "r", encoding="utf-8") as f:
+            d1 = json.load(f)
+
+        confirmed_before = d1["progress"]["confirmed_matches"]
+        revoked_before = d1["progress"]["revoked_matches"]
+
+        # 撤销2条
+        to_revoke = all_match_ids[:2]
+        revoke_success = 0
+        for mid in to_revoke:
+            r = self.revoker.revoke_match(mid, "operator_a", "撤销测试")
+            if r["success"]:
+                revoke_success += 1
+
+        self.assertEqual(revoke_success, 2, "应成功撤销2条")
+
+        # 第二次导出
+        exp2 = self.exporter.export_batch_progress(inv_batch_id, "u2", format="json")
+        with open(exp2["file_path"], "r", encoding="utf-8") as f:
+            d2 = json.load(f)
+
+        confirmed_after = d2["progress"]["confirmed_matches"]
+        revoked_after = d2["progress"]["revoked_matches"]
+
+        self.assertEqual(confirmed_after, confirmed_before - revoke_success,
+                         "撤销后confirmed应正确减少")
+        self.assertEqual(revoked_after, revoked_before + revoke_success,
+                         "撤销后revoked应正确增加")
+
+        # 工作台摘要也应同步
+        summary = self.workbench.get_batch_workbench_summary(inv_batch_id)
+        batch = summary["batches"][0]
+        self.assertEqual(batch["confirmed_matches"], confirmed_after,
+                         "工作台confirmed应与导出一致")
+        self.assertEqual(batch["revoked_matches"], revoked_after,
+                         "工作台revoked应与导出一致")
+
+
+class TestBatchWorkbenchRegressionRestartRecovery(unittest.TestCase):
+    """重启恢复回归测试：批次/筛选/处理人链路在跨实例下一致"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+        self.db = Database(self.db_path)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_restart_batch_and_filter_recovery(self):
+        """测试重启后批次选择和筛选条件恢复"""
+        importer = CSVImporter(self.config, self.db)
+        matcher = MatchEngine(self.config, self.db, None)
+        workbench1 = BatchWorkbench(self.config, self.db)
+
+        inv = importer.import_invoices(self.invoice_csv, "alice")
+        importer.import_payments(self.payment_csv, "bob")
+        inv_batch_id = inv["batch_id"]
+
+        matcher.run_auto_matching("matcher")
+
+        # 修改操作人以便测试过滤
+        with self.db._get_conn() as conn:
+            matches = conn.execute(
+                "SELECT m.* FROM matches m JOIN invoices i ON m.invoice_id = i.id "
+                "WHERE i.batch_id = ?", (inv_batch_id,)
+            ).fetchall()
+            for i, m in enumerate(matches):
+                op = "alice" if i % 2 == 0 else "bob"
+                st = MATCH_STATUS_PENDING if i == 0 else MATCH_STATUS_MATCHED
+                conn.execute(
+                    "UPDATE matches SET operator = ?, status = ? WHERE id = ?",
+                    (op, st, m["id"])
+                )
+                if st == MATCH_STATUS_MATCHED:
+                    conn.execute(
+                        "UPDATE invoices SET match_status = ? WHERE id = ?",
+                        (MATCH_STATUS_MATCHED, m["invoice_id"])
+                    )
+                    conn.execute(
+                        "UPDATE payments SET match_status = ? WHERE id = ?",
+                        (MATCH_STATUS_MATCHED, m["payment_id"])
+                    )
+                elif st == MATCH_STATUS_PENDING:
+                    conn.execute(
+                        "UPDATE invoices SET match_status = ? WHERE id = ?",
+                        (MATCH_STATUS_PENDING, m["invoice_id"])
+                    )
+                    conn.execute(
+                        "UPDATE payments SET match_status = ? WHERE id = ?",
+                        (MATCH_STATUS_PENDING, m["payment_id"])
+                    )
+
+        # 会话1：保存状态
+        workbench1.save_last_selected_batch(inv_batch_id, "user1")
+        workbench1.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        alice_before = workbench1.get_batch_matches(inv_batch_id, operator="alice")
+        bob_before = workbench1.get_batch_matches(inv_batch_id, operator="bob")
+
+        # 会话2：新实例模拟重启
+        workbench2 = BatchWorkbench(self.config, self.db)
+
+        restored_batch = workbench2.get_last_selected_batch()
+        self.assertIsNotNone(restored_batch)
+        self.assertEqual(restored_batch["batch_id"], inv_batch_id)
+
+        restored_filters = workbench2.get_filters()
+        self.assertEqual(restored_filters.get("operator"), "alice")
+        self.assertEqual(restored_filters.get("status"), MATCH_STATUS_PENDING)
+
+        # 处理人过滤一致
+        alice_after = workbench2.get_batch_matches(inv_batch_id, operator="alice")
+        bob_after = workbench2.get_batch_matches(inv_batch_id, operator="bob")
+        self.assertEqual(len(alice_after), len(alice_before))
+        self.assertEqual(len(bob_after), len(bob_before))
+
+        # 跨实例一致
+        workbench3 = BatchWorkbench(self.config, self.db)
+        b3 = workbench3.get_last_selected_batch()
+        f3 = workbench3.get_filters()
+        self.assertEqual(b3["batch_id"], restored_batch["batch_id"])
+        self.assertEqual(f3, restored_filters)
+
+        # 综合恢复接口
+        workbench4 = BatchWorkbench(self.config, self.db)
+        state = workbench4.restore_workbench_state()
+        self.assertTrue(state["has_state"])
+        self.assertTrue(state["restored"])
+        self.assertEqual(state["last_batch_id"], inv_batch_id)
 
 
 if __name__ == "__main__":
