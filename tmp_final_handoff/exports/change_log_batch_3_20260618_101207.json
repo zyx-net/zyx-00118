@@ -1,0 +1,54 @@
+{
+  "export_info": {
+    "exported_at": "2026-06-18T10:12:07.099584",
+    "exported_by": "审计员",
+    "batch_id": 3,
+    "file_name": "sample_invoices_updated.csv",
+    "file_type": "发票",
+    "imported_at": "2026-06-18 02:12:06",
+    "imported_by": "lisi",
+    "total_changes": 1,
+    "filter_note": "影响已撤销匹配",
+    "affect_filter": "revoked",
+    "export_note": "导出内容与 `batch changes` 命令筛选条件一致，包含变更前后摘要、导入来源、操作者、时间、关联批次、处理状态、冲突原因",
+    "cli_command_tip": "可执行: reconciler batch changes --batch-id 3 --affect revoked 查看 CLI 输出"
+  },
+  "summary": {
+    "by_type": {
+      "key_field_change": 1
+    },
+    "by_impact": {
+      "affects_revoked": 1
+    },
+    "by_status": {
+      "pending": 1
+    }
+  },
+  "change_logs": [
+    {
+      "日志ID": 3,
+      "批次ID": 3,
+      "来源文件": "sample_invoices_updated.csv",
+      "变更类型": "关键字段变更",
+      "记录类型": "发票",
+      "记录编号": "INV005",
+      "变更字段": "customer",
+      "原值": "杭州互联网公司",
+      "新值": "杭州互联网有限公司",
+      "变更摘要": "发票 INV005 客户从 杭州互联网公司 变为 杭州互联网有限公司",
+      "变更前摘要": "发票号: INV005, 客户: 杭州互联网公司, 日期: 2024-02-15, 金额: 3200.00, 状态: normal, 匹配状态: unmatched",
+      "变更后摘要": "发票号: INV005, 客户: 杭州互联网有限公司, 日期: 2024-02-15, 金额: 3200.00, 状态: normal, 匹配状态: unmatched",
+      "影响类型": "影响已撤销",
+      "影响详情": "匹配 #M202606180004 已撤销，变更仅作参考",
+      "影响的匹配ID": "4",
+      "是否有冲突": "否",
+      "冲突原因": "-",
+      "处理状态": "待处理",
+      "操作者": "lisi",
+      "检测时间": "2026-06-18 02:12:06",
+      "处理时间": "-",
+      "处理人": "-",
+      "备注": "-"
+    }
+  ]
+}

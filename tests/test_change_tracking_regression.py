@@ -1794,5 +1794,167 @@ class TestRestartRecoveryEnhanced(unittest.TestCase):
         del db2
 
 
+class TestStatusChangeDetectionWithVoid(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.config = Config()
+        self.config.db_path = os.path.join(self.tmpdir, "test_void.db")
+        self.config.export_dir = os.path.join(self.tmpdir, "exports")
+        os.makedirs(self.config.export_dir, exist_ok=True)
+
+        self.db = Database(self.config.db_path)
+        self.workflow = WorkflowManager(self.config, self.db)
+        self.importer = CSVImporter(self.config, self.db)
+        self.tracker = ChangeTracker(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, self.workflow)
+
+        inv_v1 = (
+            "invoice_no,invoice_date,customer,amount,status\n"
+            "V-001,2025-01-10,客户A,10000.00,normal\n"
+            "V-002,2025-01-11,客户B,5000.00,normal\n"
+            "V-003,2025-01-12,客户C,8000.00,normal\n"
+        )
+        inv_v2 = (
+            "invoice_no,invoice_date,customer,amount,status\n"
+            "V-001,2025-01-10,客户A,10000.00,normal\n"
+            "V-002,2025-01-11,客户B,5500.00,void\n"
+            "V-003,2025-01-12,客户C,8000.00,void\n"
+        )
+        pay = (
+            "payment_no,payment_date,customer,amount,status\n"
+            "P-001,2025-01-15,客户A,10000.00,normal\n"
+            "P-002,2025-01-16,客户B,5000.00,normal\n"
+            "P-003,2025-01-17,客户C,8000.00,normal\n"
+        )
+        self.inv1_path = os.path.join(self.tmpdir, "inv_v1.csv")
+        self.inv2_path = os.path.join(self.tmpdir, "inv_v2.csv")
+        self.pay_path = os.path.join(self.tmpdir, "pay.csv")
+        for path, content in [
+            (self.inv1_path, inv_v1),
+            (self.inv2_path, inv_v2),
+            (self.pay_path, pay),
+        ]:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+    def tearDown(self):
+        if hasattr(self, "db"):
+            del self.db
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _setup_matches(self):
+        self.importer.import_invoices(self.inv1_path, "op1")
+        self.importer.import_payments(self.pay_path, "op1")
+        self.matcher.run_auto_matching(operator="系统")
+        all_matches = self.db.get_matches_by_status()
+        pending = [m for m in all_matches if m["status"] == MATCH_STATUS_PENDING]
+        return pending
+
+    def test_void_status_triggers_status_change(self):
+        pending = self._setup_matches()
+        self.assertTrue(len(pending) >= 2,
+                        f"至少需要2个匹配, 实际: {len(pending)}")
+        if len(pending) >= 1:
+            self.db.confirm_match(pending[0]["id"], "mgr", "ok")
+        if len(pending) >= 2:
+            self.db.confirm_match(pending[1]["id"], "mgr", "ok")
+            self.db.revoke_match(pending[1]["id"], "mgr", "撤销测试")
+
+        reimport = self.importer.import_invoices(self.inv2_path, "op2")
+        batch_id = reimport["batch_id"]
+
+        all_logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        status_changes = [l for l in all_logs
+                          if l["change_type"] == CHANGE_TYPE_STATUS_CHANGE]
+        amount_changes = [l for l in all_logs
+                          if l["change_type"] == CHANGE_TYPE_AMOUNT_CHANGE]
+
+        self.assertTrue(len(status_changes) >= 1,
+                        f"void 状态变更应产生至少1条 status_change 日志, "
+                        f"实际: {len(status_changes)}, 全部日志类型: "
+                        f"{[l['change_type'] for l in all_logs]}")
+
+        void_status_logs = [l for l in status_changes
+                            if l.get("new_value") in ("作废", "invalid", "void")]
+        self.assertTrue(len(void_status_logs) >= 1,
+                        f"应检测到 void→作废 的状态变更, "
+                        f"实际 status_change 新值: {[l.get('new_value') for l in status_changes]}")
+
+    def test_void_status_impact_on_pending_and_revoked(self):
+        pending = self._setup_matches()
+        self.assertTrue(len(pending) >= 2,
+                        f"至少需要2个匹配, 实际: {len(pending)}")
+        if len(pending) >= 1:
+            self.db.confirm_match(pending[0]["id"], "mgr", "ok")
+        if len(pending) >= 2:
+            self.db.confirm_match(pending[1]["id"], "mgr", "ok")
+            self.db.revoke_match(pending[1]["id"], "mgr", "撤销测试")
+
+        reimport = self.importer.import_invoices(self.inv2_path, "op2")
+        batch_id = reimport["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import (
+            IMPACT_FILTER_CONFIRMED, IMPACT_FILTER_PENDING,
+            IMPACT_FILTER_REVOKED, IMPACT_FILTER_ALL_AFFECTED,
+        )
+        f_revoked = self.tracker.filter_changes_by_impact(
+            batch_id=batch_id, impact_filter=IMPACT_FILTER_REVOKED
+        )
+        f_all = self.tracker.filter_changes_by_impact(
+            batch_id=batch_id, impact_filter=IMPACT_FILTER_ALL_AFFECTED
+        )
+
+        status_in_all = [l for l in f_all
+                         if l["change_type"] == CHANGE_TYPE_STATUS_CHANGE]
+        self.assertTrue(len(status_in_all) >= 1,
+                        f"all_affected 筛选应包含状态变更, "
+                        f"实际 all_affected 中: {[l['change_type'] for l in f_all]}")
+
+        self.assertTrue(len(f_revoked) >= 1,
+                        f"--affect revoked 应返回结果(包含撤销匹配的状态变更), "
+                        f"实际: {len(f_revoked)}")
+
+        revoked_status = [l for l in f_revoked
+                          if l["change_type"] == CHANGE_TYPE_STATUS_CHANGE]
+        self.assertTrue(len(revoked_status) >= 1,
+                        f"撤销筛选中应包含状态变更, "
+                        f"撤销筛选类型: {[l['change_type'] for l in f_revoked]}")
+
+    def test_void_status_export_consistency(self):
+        pending = self._setup_matches()
+        self.assertTrue(len(pending) >= 1,
+                        f"至少需要1个匹配, 实际: {len(pending)}")
+        if len(pending) >= 1:
+            self.db.confirm_match(pending[0]["id"], "mgr", "ok")
+
+        reimport = self.importer.import_invoices(self.inv2_path, "op2")
+        batch_id = reimport["batch_id"]
+
+        all_logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        status_changes = [l for l in all_logs
+                          if l["change_type"] == CHANGE_TYPE_STATUS_CHANGE]
+
+        export_result = self.tracker.export_change_logs(
+            batch_id=batch_id, format="json", operator="test"
+        )
+        self.assertTrue(export_result.get("success"), "导出应成功")
+
+        with open(export_result["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        exported_status = [cl for cl in data.get("change_logs", [])
+                          if cl.get("变更类型") == "状态变更"]
+        self.assertEqual(len(exported_status), len(status_changes),
+                         f"JSON 导出的状态变更条数({len(exported_status)}) "
+                         f"应与数据库({len(status_changes)})一致")
+
+        for cl in exported_status:
+            self.assertIn("原值", cl, "JSON 导出应包含'原值'字段")
+            self.assertIn("新值", cl, "JSON 导出应包含'新值'字段")
+            self.assertIn("影响类型", cl, "JSON 导出应包含'影响类型'字段")
+            self.assertNotEqual(cl["影响类型"], "无影响",
+                                "已匹配记录的状态变更不应是'无影响'")
+
+
 if __name__ == "__main__":
     unittest.main()

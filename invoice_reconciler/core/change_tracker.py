@@ -537,9 +537,14 @@ class ChangeTracker:
 
             old_record = existing_records[record_no]
 
-            new_status = status_label_map.get(new_record["status"], new_record["status"])
-            old_status = status_label_map.get(old_record["status"], old_record["status"])
-            if old_status != new_status:
+            new_status_raw = new_record["status"]
+            old_status_raw = old_record["status"]
+            new_status = status_label_map.get(new_status_raw, new_status_raw)
+            old_status = status_label_map.get(old_status_raw, old_status_raw)
+            if old_status_raw != new_status_raw or old_status != new_status:
+                if old_status == new_status:
+                    old_status = old_status_raw
+                    new_status = new_status_raw
                 log_id = self.track_status_change(
                     batch_id, file_type, record_no, old_record, new_record,
                     old_status, new_status, operator

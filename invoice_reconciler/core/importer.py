@@ -15,15 +15,23 @@ from .database import (
 STATUS_MAP_INVOICE = {
     "正常": INVOICE_STATUS_NORMAL,
     "normal": INVOICE_STATUS_NORMAL,
-    "作废": "invalid",
+    "作废": INVOICE_STATUS_INVALID,
     "invalid": INVOICE_STATUS_INVALID,
+    "void": INVOICE_STATUS_INVALID,
+    "cancelled": INVOICE_STATUS_INVALID,
+    "canceled": INVOICE_STATUS_INVALID,
+    "取消": INVOICE_STATUS_INVALID,
 }
 
 STATUS_MAP_PAYMENT = {
     "正常": PAYMENT_STATUS_NORMAL,
     "normal": PAYMENT_STATUS_NORMAL,
-    "作废": "invalid",
+    "作废": PAYMENT_STATUS_INVALID,
     "invalid": PAYMENT_STATUS_INVALID,
+    "void": PAYMENT_STATUS_INVALID,
+    "cancelled": PAYMENT_STATUS_INVALID,
+    "canceled": PAYMENT_STATUS_INVALID,
+    "取消": PAYMENT_STATUS_INVALID,
 }
 
 STATUS_LABEL_INVOICE = {
@@ -31,6 +39,10 @@ STATUS_LABEL_INVOICE = {
     "normal": "正常",
     INVOICE_STATUS_INVALID: "作废",
     "invalid": "作废",
+    "void": "作废",
+    "cancelled": "作废",
+    "canceled": "作废",
+    "取消": "作废",
 }
 
 STATUS_LABEL_PAYMENT = {
@@ -38,6 +50,10 @@ STATUS_LABEL_PAYMENT = {
     "normal": "正常",
     PAYMENT_STATUS_INVALID: "作废",
     "invalid": "作废",
+    "void": "作废",
+    "cancelled": "作废",
+    "canceled": "作废",
+    "取消": "作废",
 }
 
 

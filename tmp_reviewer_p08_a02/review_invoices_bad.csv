@@ -1,0 +1,2 @@
+﻿invoice_no,invoice_date,customer,amount,status
+BAD-001,2025-01-10,,abc,normal

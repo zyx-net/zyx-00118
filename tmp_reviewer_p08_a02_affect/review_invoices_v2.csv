@@ -1,0 +1,4 @@
+﻿invoice_no,invoice_date,customer,amount,status
+R-001,2025-01-10,客户A,10000.00,normal
+R-002,2025-01-11,客户B,5500.00,void
+R-003,2025-01-12,客户C,8000.00,void
