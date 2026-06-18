@@ -611,13 +611,12 @@ class ChangeTracker:
             "conflict_count": conflict_count,
         }
 
-    def get_change_summary(self, batch_id: int = None) -> Dict:
-        logs = self.db.get_batch_change_logs(batch_id=batch_id)
-
+    def compute_summary_from_logs(self, logs: List[Dict]) -> Dict:
         total = len(logs)
         by_type = {}
         by_impact = {}
         by_status = {}
+        conflict_count = 0
 
         for log in logs:
             ct = log["change_type"]
@@ -629,19 +628,95 @@ class ChangeTracker:
             ps = log["processing_status"] or PROCESSING_STATUS_PENDING
             by_status[ps] = by_status.get(ps, 0) + 1
 
+            if log.get("conflict_reason"):
+                conflict_count += 1
+
         return {
             "success": True,
             "total_changes": total,
             "by_type": by_type,
             "by_impact": by_impact,
             "by_status": by_status,
+            "conflict_count": conflict_count,
+        }
+
+    def get_change_summary(self, batch_id: int = None) -> Dict:
+        logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        return self.compute_summary_from_logs(logs)
+
+    def get_filtered_changes(self, batch_id: int = None,
+                             change_type: str = None,
+                             impact_type: str = None,
+                             processing_status: str = None,
+                             record_no: str = None,
+                             affect_filter: str = None,
+                             with_conflicts_only: bool = False,
+                             operator: str = None) -> Dict:
+        logs = self.db.get_batch_change_logs(
+            batch_id=batch_id,
+            change_type=change_type,
+            impact_type=impact_type,
+            processing_status=processing_status,
+            record_no=record_no,
+        )
+
+        if affect_filter:
+            filter_map = {
+                IMPACT_FILTER_CONFIRMED: lambda l: l["impact_type"] in (
+                    IMPACT_TYPE_CONFIRMED, IMPACT_TYPE_CRITICAL
+                ),
+                IMPACT_FILTER_PENDING: lambda l: l["impact_type"] == IMPACT_TYPE_PENDING,
+                IMPACT_FILTER_REVOKED: lambda l: l["impact_type"] == IMPACT_TYPE_REVOKED,
+                IMPACT_FILTER_ALL_AFFECTED: lambda l: l["impact_type"] != IMPACT_TYPE_NONE,
+            }
+            predicate = filter_map.get(affect_filter, filter_map[IMPACT_FILTER_ALL_AFFECTED])
+            logs = [l for l in logs if predicate(l)]
+
+        if with_conflicts_only:
+            logs = [l for l in logs if l.get("conflict_reason")]
+
+        summary = self.compute_summary_from_logs(logs)
+
+        filter_info = {
+            "batch_id": batch_id,
+            "change_type": change_type,
+            "impact_type": impact_type,
+            "processing_status": processing_status,
+            "record_no": record_no,
+            "affect_filter": affect_filter,
+            "with_conflicts_only": with_conflicts_only,
+        }
+
+        self.db.insert_audit_log(
+            action_type=AUDIT_ACTION_CHANGE_VIEWED,
+            action_category=AUDIT_CATEGORY_CHANGE_VIEW,
+            action_summary=(
+                f"筛选查看批次 #{batch_id if batch_id else '全部'} "
+                f"变更：命中 {len(logs)} 条"
+            ),
+            batch_id=batch_id,
+            operator=operator,
+            action_details=json.dumps({
+                "filter": filter_info,
+                "hit_count": len(logs),
+                "summary": summary,
+            }, ensure_ascii=False),
+            status="success",
+        )
+
+        return {
+            "success": True,
+            "logs": logs,
+            "summary": summary,
+            "filter_info": filter_info,
+            "hit_count": len(logs),
         }
 
     def export_change_logs(self, batch_id: int, operator: str = None,
                            format: str = "json", log_ids: List[int] = None,
                            extra_meta: Dict = None) -> Dict:
         logs = self.db.get_batch_change_logs(batch_id=batch_id)
-        if log_ids:
+        if log_ids is not None:
             id_set = set(log_ids)
             logs = [l for l in logs if l["id"] in id_set]
             logs.sort(key=lambda x: log_ids.index(x["id"]) if x["id"] in log_ids else 9999)
@@ -688,24 +763,22 @@ class ChangeTracker:
         }
         if extra_meta:
             export_info.update(extra_meta)
+
+        summary_data = self.compute_summary_from_logs(logs)
+
         export_data = {
             "export_info": export_info,
             "summary": {
-                "by_type": {},
-                "by_impact": {},
-                "by_status": {},
+                "by_type": summary_data["by_type"],
+                "by_impact": summary_data["by_impact"],
+                "by_status": summary_data["by_status"],
+                "conflict_count": summary_data["conflict_count"],
+                "total_changes": summary_data["total_changes"],
             },
             "change_logs": [],
         }
 
         for log in logs:
-            ct = log["change_type"]
-            export_data["summary"]["by_type"][ct] = export_data["summary"]["by_type"].get(ct, 0) + 1
-            it = log["impact_type"] or IMPACT_TYPE_NONE
-            export_data["summary"]["by_impact"][it] = export_data["summary"]["by_impact"].get(it, 0) + 1
-            ps = log["processing_status"] or PROCESSING_STATUS_PENDING
-            export_data["summary"]["by_status"][ps] = export_data["summary"]["by_status"].get(ps, 0) + 1
-
             conflict_reason_val = log.get("conflict_reason") or "-"
             has_conflict = "是" if log.get("conflict_reason") else "否"
 

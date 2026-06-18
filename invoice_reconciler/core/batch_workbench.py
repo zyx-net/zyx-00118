@@ -413,12 +413,18 @@ class BatchWorkbench:
                                   change_type: str = None,
                                   impact_type: str = None,
                                   processing_status: str = None,
+                                  record_no: str = None,
+                                  affect_filter: str = None,
+                                  with_conflicts_only: bool = None,
                                   operator: str = None) -> None:
         context = {
             "batch_id": batch_id,
             "change_type": change_type,
             "impact_type": impact_type,
             "processing_status": processing_status,
+            "record_no": record_no,
+            "affect_filter": affect_filter,
+            "with_conflicts_only": with_conflicts_only,
             "operator": operator,
             "viewed_at": datetime.now().isoformat(),
         }
@@ -438,3 +444,102 @@ class BatchWorkbench:
                 context["file_type"] = "发票" if batch_info["file_type"] == "invoice" else "收款"
 
         return context
+
+    def get_unified_change_view(self, batch_id: int = None,
+                                 change_type: str = None,
+                                 impact_type: str = None,
+                                 processing_status: str = None,
+                                 record_no: str = None,
+                                 affect_filter: str = None,
+                                 with_conflicts_only: bool = False,
+                                 operator: str = None) -> Dict:
+        from .change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+
+        result = tracker.get_filtered_changes(
+            batch_id=batch_id,
+            change_type=change_type,
+            impact_type=impact_type,
+            processing_status=processing_status,
+            record_no=record_no,
+            affect_filter=affect_filter,
+            with_conflicts_only=with_conflicts_only,
+            operator=operator,
+        )
+
+        if batch_id:
+            self.save_last_selected_batch(batch_id, operator)
+
+        self.save_change_view_context(
+            batch_id=batch_id,
+            change_type=change_type,
+            impact_type=impact_type,
+            processing_status=processing_status,
+            record_no=record_no,
+            affect_filter=affect_filter,
+            with_conflicts_only=with_conflicts_only,
+            operator=operator,
+        )
+
+        full_summary = tracker.get_change_summary(batch_id=batch_id)
+
+        result["full_summary"] = full_summary
+        result["is_filtered"] = any([
+            change_type, impact_type, processing_status,
+            record_no, affect_filter, with_conflicts_only
+        ])
+
+        return result
+
+    def export_changes_with_last_filter(self, batch_id: int,
+                                         export_format: str = "json",
+                                         operator: str = None) -> Dict:
+        from .change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+
+        last_view = self.get_last_change_view_context()
+        filters = {}
+        has_filters = False
+        if last_view:
+            filters = {
+                "change_type": last_view.get("change_type"),
+                "impact_type": last_view.get("impact_type"),
+                "processing_status": last_view.get("processing_status"),
+                "record_no": last_view.get("record_no"),
+                "affect_filter": last_view.get("affect_filter"),
+                "with_conflicts_only": last_view.get("with_conflicts_only") or False,
+            }
+            applied = {k: v for k, v in filters.items() 
+                      if v is not None and v is not False}
+            has_filters = len(applied) > 0
+
+        filtered = tracker.get_filtered_changes(
+            batch_id=batch_id,
+            operator=operator,
+            **{k: v for k, v in filters.items() if v is not None and v is not False}
+        )
+
+        log_ids = [l["id"] for l in filtered["logs"]]
+
+        extra_meta = {
+            "filter_note": "使用上次视图的筛选条件" if has_filters else "未应用筛选，导出全量变更",
+            "applied_filters": {k: v for k, v in filters.items() if v is not None and v is not False},
+            "hit_count": len(log_ids),
+        }
+
+        result = tracker.export_change_logs(
+            batch_id, operator, format=export_format,
+            log_ids=log_ids if has_filters else None,
+            extra_meta=extra_meta,
+        )
+
+        self.save_export_context(
+            batch_id=batch_id,
+            export_type="change_logs",
+            format=export_format,
+            operator=operator,
+            filters=filters,
+            extra=extra_meta,
+        )
+
+        return result

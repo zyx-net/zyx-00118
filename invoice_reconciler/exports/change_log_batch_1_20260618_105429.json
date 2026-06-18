@@ -1,0 +1,27 @@
+{
+  "export_info": {
+    "exported_at": "2026-06-18T10:54:29.163264",
+    "exported_by": "admin",
+    "batch_id": 1,
+    "file_name": "sample_invoices.csv",
+    "file_type": "发票",
+    "imported_at": "2026-06-17 22:20:44",
+    "imported_by": "zhangsan",
+    "total_changes": 0,
+    "filter_note": "未应用筛选，导出全量变更",
+    "applied_filters": {
+      "batch_id": 1
+    },
+    "hit_count": 0,
+    "export_note": "导出内容与 `batch changes` 命令筛选条件完全一致，包含变更前后摘要、导入来源、操作者、时间、关联批次、处理状态、冲突原因",
+    "cli_command_tip": "可执行: reconciler batch changes --batch-id 1 查看 CLI 输出"
+  },
+  "summary": {
+    "by_type": {},
+    "by_impact": {},
+    "by_status": {},
+    "conflict_count": 0,
+    "total_changes": 0
+  },
+  "change_logs": []
+}
