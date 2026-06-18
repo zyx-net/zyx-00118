@@ -7,6 +7,7 @@ import shutil
 import stat
 import yaml
 from datetime import datetime
+from unittest.mock import patch
 from click.testing import CliRunner
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,13 +25,25 @@ from invoice_reconciler.core.matcher import MatchEngine
 from invoice_reconciler.core.batch_workbench import BatchWorkbench
 from invoice_reconciler.core.handover import (
     BatchHandover,
+    HandoverPlaybackCenter,
     HANDOVER_STATUS_ACTIVE,
     HANDOVER_STATUS_DISCARDED,
     HANDOVER_STATUS_RESTORED,
     HANDOVER_EVENT_CREATE,
+    HANDOVER_EVENT_RESTORE,
+    HANDOVER_EVENT_UNDO,
+    HANDOVER_EVENT_SAVE_COPY,
+    HANDOVER_EVENT_CLEANUP,
+    HANDOVER_EVENT_EXPORT_PACKAGE,
+    HANDOVER_EVENT_RESUME_EXPORT,
+    HANDOVER_EVENT_VIEW_SUMMARY,
     HANDOVER_CONFLICT_REIMPORT,
     HANDOVER_CONFLICT_CONFIG_MISMATCH,
     HANDOVER_CONFLICT_EXPORT_NOT_WRITABLE,
+    HANDOVER_EXPORT_STATUS_PENDING,
+    HANDOVER_EXPORT_STATUS_PARTIAL,
+    HANDOVER_EXPORT_STATUS_COMPLETE,
+    HANDOVER_EXPORT_STATUS_FAILED,
 )
 from invoice_reconciler.cli.main import cli
 
@@ -792,6 +805,800 @@ class TestHandoverCLICommands(unittest.TestCase):
         r = self._run_cmd("handover", "timeline")
         self.assertEqual(r.exit_code, 0, f"handover timeline failed: {r.output}\n{r.exception}")
         self.assertIn("时间线", r.output)
+
+
+class TestHandoverPlaybackCenterCore(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        self.invoice_updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+        with open(self.invoice_updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+
+        self.db = Database(self.db_path)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, None)
+        self.workbench = BatchWorkbench(self.config, self.db)
+        self.handover = BatchHandover(self.config, self.db)
+        self.playback = HandoverPlaybackCenter(self.config, self.db)
+
+        inv_result = self.importer.import_invoices(self.invoice_csv, "init_user")
+        self.importer.import_payments(self.payment_csv, "init_user")
+        self.inv_batch_id = inv_result["batch_id"]
+        self.matcher.run_auto_matching("init_user")
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_get_session_summary_success(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="test package")
+        self.assertTrue(pkg_result["success"])
+        package_id = pkg_result["package_id"]
+
+        summary = self.playback.get_session_summary(package_id, "alice")
+        self.assertTrue(summary["success"])
+        self.assertEqual(summary["package_id"], package_id)
+        self.assertIn("summary", summary)
+        self.assertIn("conflicts", summary)
+        self.assertIn("file_status", summary)
+        self.assertIn("available_actions", summary)
+
+    def test_session_summary_shows_filters(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+        self.workbench.save_change_view_context(
+            batch_id=self.inv_batch_id,
+            change_type="field_change",
+            operator="alice",
+        )
+
+        pkg_result = self.handover.create_package("alice", description="filters test")
+        package_id = pkg_result["package_id"]
+
+        summary = self.playback.get_session_summary(package_id, "alice")
+        self.assertTrue(summary["success"])
+        self.assertFalse(summary["summary"]["is_full_view"])
+        self.assertTrue(summary["summary"]["has_active_filters"])
+
+    def test_session_summary_full_view_warning(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+
+        pkg_result = self.handover.create_package("alice", description="no filters")
+        package_id = pkg_result["package_id"]
+
+        summary = self.playback.get_session_summary(package_id, "alice")
+        self.assertTrue(summary["success"])
+        self.assertTrue(summary["summary"]["is_full_view"])
+        self.assertFalse(summary["summary"]["has_active_filters"])
+
+    def test_resume_export_with_filters(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_MATCHED)
+
+        pkg_result = self.handover.create_package("alice", description="for resume")
+        package_id = pkg_result["package_id"]
+
+        self.workbench.clear_workbench_state()
+
+        result = self.playback.resume_export(package_id, "alice")
+        self.assertTrue(result["success"])
+        self.assertIn("undo_id", result)
+        self.assertIn("export_result", result)
+
+    def test_resume_export_full_view_blocked(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+
+        pkg_result = self.handover.create_package("alice", description="no filters")
+        package_id = pkg_result["package_id"]
+
+        result = self.playback.resume_export(package_id, "alice")
+        self.assertFalse(result["success"])
+        self.assertEqual(result.get("warning"), "full_view_fallback")
+        self.assertIn("full_view_fallback", result.get("warning", ""))
+
+    def test_resume_export_full_view_force_allowed(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+
+        pkg_result = self.handover.create_package("alice", description="no filters force")
+        package_id = pkg_result["package_id"]
+
+        result = self.playback.resume_export(package_id, "alice", force=True)
+        self.assertTrue(result["success"])
+
+    def test_resume_export_with_reimport_conflict(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="before reimport")
+        package_id = pkg_result["package_id"]
+
+        self.importer.import_invoices(self.invoice_updated_csv, "bob")
+
+        result = self.playback.resume_export(package_id, "alice")
+        self.assertFalse(result["success"])
+        self.assertIn("conflicts", result)
+
+        conflict_types = [c["conflict_type"] for c in result["conflicts"]]
+        self.assertIn(HANDOVER_CONFLICT_REIMPORT, conflict_types)
+
+    def test_export_handover_package(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="export test")
+        package_id = pkg_result["package_id"]
+
+        result = self.playback.export_handover_package(
+            package_id, "alice", format="json"
+        )
+        self.assertTrue(result["success"])
+        self.assertIn("export_path", result)
+        self.assertIn("files", result)
+
+        self.assertTrue(os.path.exists(result["export_path"]))
+
+        meta_file = os.path.join(result["export_path"], "交接包元数据.json")
+        self.assertTrue(os.path.exists(meta_file))
+
+        state_file = os.path.join(result["export_path"], "会话状态.json")
+        self.assertTrue(os.path.exists(state_file))
+
+        filters_file = os.path.join(result["export_path"], "筛选条件.json")
+        self.assertTrue(os.path.exists(filters_file))
+
+        readme_file = os.path.join(result["export_path"], "README.md")
+        self.assertTrue(os.path.exists(readme_file))
+
+    def test_detailed_timeline_records_events(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        pkg_result = self.handover.create_package("alice", description="timeline test")
+        package_id = pkg_result["package_id"]
+
+        self.handover.restore_package(package_id, "bob", force=True)
+
+        timeline = self.playback.get_detailed_timeline(package_id=package_id)
+        self.assertGreater(len(timeline), 0)
+
+        event_types = [e["event_type"] for e in timeline]
+        self.assertIn(HANDOVER_EVENT_CREATE, event_types)
+        self.assertIn(HANDOVER_EVENT_RESTORE, event_types)
+
+    def test_detailed_timeline_has_event_details(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        pkg_result = self.handover.create_package("alice", description="details test")
+        package_id = pkg_result["package_id"]
+
+        timeline = self.playback.get_detailed_timeline(package_id=package_id)
+        self.assertGreater(len(timeline), 0)
+
+        event = timeline[0]
+        self.assertIn("event_id", event)
+        self.assertIn("event_type", event)
+        self.assertIn("event_type_label", event)
+        self.assertIn("status", event)
+        self.assertIn("timestamp", event)
+
+    def test_check_duplicate_import_conflict(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        pkg_result = self.handover.create_package("alice", description="conflict test")
+        package_id = pkg_result["package_id"]
+
+        result = self.playback.check_duplicate_import_conflict(package_id)
+        self.assertTrue(result["success"])
+        self.assertFalse(result["has_conflict"])
+
+        self.importer.import_invoices(self.invoice_updated_csv, "bob")
+
+        result = self.playback.check_duplicate_import_conflict(package_id)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["has_conflict"])
+        self.assertEqual(result["conflict_type"], HANDOVER_CONFLICT_REIMPORT)
+
+    def test_verify_config_isolation(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        pkg_result = self.handover.create_package("alice", description="iso test")
+        package_id = pkg_result["package_id"]
+
+        result = self.playback.verify_config_isolation(package_id)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["is_match"])
+        self.assertFalse(result["has_conflict"])
+
+        other_config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=7200,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+        other_playback = HandoverPlaybackCenter(other_config, self.db)
+        result = other_playback.verify_config_isolation(package_id)
+        self.assertTrue(result["success"])
+        self.assertFalse(result["is_match"])
+        self.assertTrue(result["has_conflict"])
+
+    def test_cleanup_expired_sessions(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        pkg1 = self.handover.create_package("alice", description="expired test 1")
+        pkg2 = self.handover.create_package("alice", description="expired test 2")
+
+        self.handover.discard_package(pkg1["package_id"], "alice")
+        self.handover.discard_package(pkg2["package_id"], "alice")
+
+        result = self.playback.cleanup_expired_sessions("system", max_age_days=0)
+        self.assertTrue(result["success"])
+        self.assertGreater(result["removed_count"], 0)
+
+    def test_cleanup_records_event(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        pkg = self.handover.create_package("alice", description="cleanup event test")
+        self.handover.discard_package(pkg["package_id"], "alice")
+
+        self.playback.cleanup_expired_sessions("system", max_age_days=0)
+
+        timeline = self.playback.get_detailed_timeline()
+        event_types = [e["event_type"] for e in timeline]
+        self.assertIn(HANDOVER_EVENT_CLEANUP, event_types)
+
+    def test_session_summary_available_actions(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="actions test")
+        package_id = pkg_result["package_id"]
+
+        summary = self.playback.get_session_summary(package_id, "alice")
+        actions = summary["available_actions"]
+
+        action_ids = [a["action_id"] for a in actions]
+        self.assertIn("view_filters", action_ids)
+        self.assertIn("view_summary", action_ids)
+        self.assertIn("resume_export", action_ids)
+        self.assertIn("export_json", action_ids)
+        self.assertIn("export_csv", action_ids)
+        self.assertIn("check_files", action_ids)
+        self.assertIn("discard_session", action_ids)
+
+    def test_resume_export_records_detailed_events(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_MATCHED)
+
+        pkg_result = self.handover.create_package("alice", description="event test")
+        package_id = pkg_result["package_id"]
+
+        self.workbench.clear_workbench_state()
+        self.playback.resume_export(package_id, "alice")
+
+        timeline = self.playback.get_detailed_timeline(package_id=package_id)
+        event_types = [e["event_type"] for e in timeline]
+
+        self.assertIn(HANDOVER_EVENT_VIEW_SUMMARY, event_types)
+        self.assertIn(HANDOVER_EVENT_RESUME_EXPORT, event_types)
+
+
+class TestHandoverAcceptanceFullWorkflow(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+        self.config_path = os.path.join(self.test_dir, "config.yaml")
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+        self.invoice_updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+        with open(self.invoice_updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+
+        config_data = {
+            "amount_tolerance": 0.001,
+            "date_window_days": 30,
+            "invoice_required_columns": ["invoice_no", "invoice_date", "customer", "amount", "status"],
+            "payment_required_columns": ["payment_no", "payment_date", "customer", "amount"],
+            "export_format": "json",
+            "db_path": self.db_path,
+            "export_dir": self.export_dir,
+            "lock_timeout_seconds": 3600,
+            "admin_users": ["admin"],
+            "enable_lock": False,
+        }
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
+
+        self.runner = CliRunner()
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _run_cmd(self, *args):
+        full_args = ["--config", self.config_path] + list(args)
+        result = self.runner.invoke(cli, full_args)
+        return result
+
+    def test_full_filter_export_handover_resume_workflow(self):
+        r = self._run_cmd("import", "invoices", self.invoice_csv, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0, f"import invoices failed: {r.output}")
+
+        r = self._run_cmd("import", "payments", self.payment_csv, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0, f"import payments failed: {r.output}")
+
+        r = self._run_cmd("match", "--operator", "alice")
+        self.assertEqual(r.exit_code, 0, f"match failed: {r.output}")
+
+        r = self._run_cmd("handover", "create", "--operator", "alice",
+                          "--description", "交接测试：完整链路")
+        self.assertEqual(r.exit_code, 0, f"handover create failed: {r.output}")
+        self.assertIn("[OK]", r.output)
+
+        db = Database(self.db_path)
+        config = Config.load(self.config_path)
+        handover = BatchHandover(config, db)
+        packages = handover.list_packages()
+        self.assertGreater(len(packages), 0)
+        package_id = packages[0]["package_id"]
+
+        r = self._run_cmd("handover", "session-summary", package_id, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0, f"session-summary failed: {r.output}")
+        self.assertIn("交接会话摘要", r.output)
+        self.assertIn("筛选条件", r.output)
+        self.assertIn("导出摘要", r.output)
+        self.assertIn("文件状态", r.output)
+        self.assertIn("可用动作", r.output)
+
+        r = self._run_cmd("handover", "export-package", package_id, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0, f"export-package failed: {r.output}")
+        self.assertIn("[OK]", r.output)
+        self.assertIn("导出路径", r.output)
+
+        playback = HandoverPlaybackCenter(config, db)
+        export_result = playback.export_handover_package(package_id, "alice")
+        pkg_export_dir = export_result["export_path"]
+        self.assertTrue(os.path.exists(pkg_export_dir))
+
+        meta_file = os.path.join(pkg_export_dir, "交接包元数据.json")
+        self.assertTrue(os.path.exists(meta_file))
+        with open(meta_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        self.assertEqual(meta["package_id"], package_id)
+        self.assertIn("summary", meta)
+
+        r = self._run_cmd("handover", "resume-export", package_id, "--operator", "bob", "--force")
+        self.assertEqual(r.exit_code, 0, f"resume-export failed: {r.output}")
+        self.assertIn("[OK]", r.output)
+        self.assertIn("撤销ID", r.output)
+
+        r = self._run_cmd("handover", "detailed-timeline", "--package-id", package_id)
+        self.assertEqual(r.exit_code, 0, f"detailed-timeline failed: {r.output}")
+        self.assertIn("详细操作时间线", r.output)
+
+    def test_cross_restart_recovery_with_filters(self):
+        self._run_cmd("import", "invoices", self.invoice_csv, "--operator", "alice")
+        self._run_cmd("import", "payments", self.payment_csv, "--operator", "alice")
+        self._run_cmd("match", "--operator", "alice")
+
+        db1 = Database(self.db_path)
+        config = Config.load(self.config_path)
+        workbench1 = BatchWorkbench(config, db1)
+        handover1 = BatchHandover(config, db1)
+        playback1 = HandoverPlaybackCenter(config, db1)
+
+        workbench1.save_last_selected_batch(1, "alice")
+        workbench1.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+        workbench1.save_change_view_context(
+            batch_id=1, change_type="field_change", operator="alice"
+        )
+
+        pkg_result = handover1.create_package("alice", description="重启前交接包")
+        self.assertTrue(pkg_result["success"])
+        package_id = pkg_result["package_id"]
+
+        summary1 = playback1.get_session_summary(package_id, "alice")
+        self.assertTrue(summary1["success"])
+        self.assertFalse(summary1["summary"]["is_full_view"])
+
+        del workbench1
+        del handover1
+        del playback1
+        del db1
+
+        db2 = Database(self.db_path)
+        workbench2 = BatchWorkbench(config, db2)
+        handover2 = BatchHandover(config, db2)
+        playback2 = HandoverPlaybackCenter(config, db2)
+
+        workbench2.clear_workbench_state()
+
+        last_batch_before = workbench2.get_last_selected_batch()
+        self.assertIsNone(last_batch_before)
+
+        summary2 = playback2.get_session_summary(package_id, "bob")
+        self.assertTrue(summary2["success"])
+        self.assertFalse(summary2["summary"]["is_full_view"])
+
+        actions = summary2["available_actions"]
+        resume_action = next((a for a in actions if a["action_id"] == "resume_export"), None)
+        self.assertIsNotNone(resume_action)
+        self.assertTrue(resume_action["enabled"])
+
+        resume_result = playback2.resume_export(package_id, "bob")
+        self.assertTrue(resume_result["success"])
+
+        last_batch_after = workbench2.get_last_selected_batch()
+        self.assertIsNotNone(last_batch_after)
+        self.assertEqual(last_batch_after["batch_id"], 1)
+
+        filters_after = workbench2.get_filters()
+        self.assertEqual(filters_after.get("operator"), "alice")
+        self.assertEqual(filters_after.get("status"), MATCH_STATUS_PENDING)
+
+    def test_config_isolation_acceptance(self):
+        config_a_path = os.path.join(self.test_dir, "config_a.yaml")
+        config_b_path = os.path.join(self.test_dir, "config_b.yaml")
+        db_a = os.path.join(self.test_dir, "db_a.db")
+        db_b = os.path.join(self.test_dir, "db_b.db")
+        export_a = os.path.join(self.test_dir, "export_a")
+        export_b = os.path.join(self.test_dir, "export_b")
+
+        config_data_a = {
+            "amount_tolerance": 0.001,
+            "date_window_days": 30,
+            "invoice_required_columns": ["invoice_no", "invoice_date", "customer", "amount", "status"],
+            "payment_required_columns": ["payment_no", "payment_date", "customer", "amount"],
+            "export_format": "json",
+            "db_path": db_a,
+            "export_dir": export_a,
+            "lock_timeout_seconds": 3600,
+            "admin_users": ["admin"],
+            "enable_lock": True,
+        }
+        with open(config_a_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data_a, f, default_flow_style=False, allow_unicode=True)
+
+        config_data_b = {
+            "amount_tolerance": 0.01,
+            "date_window_days": 60,
+            "invoice_required_columns": ["invoice_no", "invoice_date", "customer", "amount", "status"],
+            "payment_required_columns": ["payment_no", "payment_date", "customer", "amount"],
+            "export_format": "csv",
+            "db_path": db_b,
+            "export_dir": export_b,
+            "lock_timeout_seconds": 7200,
+            "admin_users": ["admin"],
+            "enable_lock": False,
+        }
+        with open(config_b_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data_b, f, default_flow_style=False, allow_unicode=True)
+
+        def run_with_config(config_path, *args):
+            full_args = ["--config", config_path] + list(args)
+            return self.runner.invoke(cli, full_args)
+
+        r = run_with_config(config_a_path, "import", "invoices", self.invoice_csv, "--operator", "user_a")
+        self.assertEqual(r.exit_code, 0)
+        r = run_with_config(config_a_path, "import", "payments", self.payment_csv, "--operator", "user_a")
+        self.assertEqual(r.exit_code, 0)
+        r = run_with_config(config_a_path, "match", "--operator", "user_a")
+        self.assertEqual(r.exit_code, 0)
+
+        r = run_with_config(config_a_path, "handover", "create", "--operator", "user_a",
+                            "--description", "配置A的交接包")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+
+        r = run_with_config(config_b_path, "handover", "list")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("暂无交接包", r.output)
+
+    def test_permission_failure_rollback_acceptance(self):
+        self._run_cmd("import", "invoices", self.invoice_csv, "--operator", "alice")
+        self._run_cmd("import", "payments", self.payment_csv, "--operator", "alice")
+        self._run_cmd("match", "--operator", "alice")
+
+        db = Database(self.db_path)
+        config = Config.load(self.config_path)
+        workbench = BatchWorkbench(config, db)
+        handover = BatchHandover(config, db)
+        playback = HandoverPlaybackCenter(config, db)
+
+        workbench.save_last_selected_batch(1, "alice")
+        workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        workbench.save_export_context(
+            batch_id=1,
+            export_type="change_logs",
+            format="json",
+            operator="alice",
+        )
+
+        pkg_result = handover.create_package("alice", description="权限测试")
+        package_id = pkg_result["package_id"]
+
+        original_filters = workbench.get_filters()
+        self.assertEqual(original_filters.get("status"), MATCH_STATUS_PENDING)
+
+        workbench.save_filters(operator="bob", status=MATCH_STATUS_MATCHED)
+        filters_before_restore = workbench.get_filters()
+        self.assertEqual(filters_before_restore.get("status"), MATCH_STATUS_MATCHED)
+
+        restore_result = handover.restore_package(package_id, "charlie", force=True)
+        self.assertTrue(restore_result["success"])
+        undo_id = restore_result["undo_id"]
+        self.assertIsNotNone(undo_id)
+
+        filters_after_restore = workbench.get_filters()
+        self.assertEqual(filters_after_restore.get("status"), MATCH_STATUS_PENDING)
+
+        undo_result = handover.undo_restore(undo_id, "dave")
+        self.assertTrue(undo_result["success"])
+
+        filters_after_undo = workbench.get_filters()
+        self.assertEqual(filters_after_undo.get("status"), MATCH_STATUS_MATCHED)
+
+        timeline = playback.get_detailed_timeline(package_id=package_id)
+        event_types = [e["event_type"] for e in timeline]
+        self.assertIn(HANDOVER_EVENT_CREATE, event_types)
+        self.assertIn(HANDOVER_EVENT_RESTORE, event_types)
+        self.assertIn(HANDOVER_EVENT_UNDO, event_types)
+
+    def test_cli_command_chain_acceptance(self):
+        r = self._run_cmd("import", "invoices", self.invoice_csv, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0)
+        r = self._run_cmd("import", "payments", self.payment_csv, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0)
+        r = self._run_cmd("match", "--operator", "alice")
+        self.assertEqual(r.exit_code, 0)
+
+        r = self._run_cmd("handover", "create", "--operator", "alice",
+                          "--description", "CLI链路测试")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+
+        db = Database(self.db_path)
+        config = Config.load(self.config_path)
+        handover = BatchHandover(config, db)
+        packages = handover.list_packages()
+        package_id = packages[0]["package_id"]
+
+        r = self._run_cmd("handover", "list")
+        self.assertEqual(r.exit_code, 0)
+        self.assertNotIn("暂无交接包", r.output)
+
+        r = self._run_cmd("handover", "preview", package_id)
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("交接包预览", r.output)
+
+        r = self._run_cmd("handover", "session-summary", package_id, "--operator", "alice")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("交接会话摘要", r.output)
+        self.assertIn("可用动作", r.output)
+
+        r = self._run_cmd("handover", "diff", package_id)
+        self.assertEqual(r.exit_code, 0)
+
+        r = self._run_cmd("handover", "save-copy", package_id, "--operator", "alice",
+                          "--description", "副本测试")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+
+        r = self._run_cmd("handover", "restore", package_id, "--operator", "bob", "--force")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+        self.assertIn("撤销ID", r.output)
+
+        r = self._run_cmd("handover", "resume-export", package_id, "--operator", "charlie", "--force")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+
+        r = self._run_cmd("handover", "export-package", package_id, "--operator", "dave")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+
+        r = self._run_cmd("handover", "detailed-timeline")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("详细操作时间线", r.output)
+
+        r = self._run_cmd("handover", "discard", package_id, "--operator", "eve")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("[OK]", r.output)
+
+        r = self._run_cmd("handover", "cleanup", "--operator", "system")
+        self.assertEqual(r.exit_code, 0)
+
+    def test_duplicate_import_conflict_acceptance(self):
+        self._run_cmd("import", "invoices", self.invoice_csv, "--operator", "alice")
+        self._run_cmd("import", "payments", self.payment_csv, "--operator", "alice")
+        self._run_cmd("match", "--operator", "alice")
+
+        db = Database(self.db_path)
+        config = Config.load(self.config_path)
+        handover = BatchHandover(config, db)
+        playback = HandoverPlaybackCenter(config, db)
+        workbench = BatchWorkbench(config, db)
+
+        workbench.save_last_selected_batch(1, "alice")
+        workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = handover.create_package("alice", description="冲突测试")
+        package_id = pkg_result["package_id"]
+
+        summary_before = playback.get_session_summary(package_id, "alice")
+        self.assertFalse(summary_before["has_conflicts"])
+
+        r = self._run_cmd("import", "invoices", self.invoice_updated_csv, "--operator", "bob")
+        self.assertEqual(r.exit_code, 0)
+
+        summary_after = playback.get_session_summary(package_id, "alice")
+        self.assertTrue(summary_after["has_conflicts"])
+
+        conflict_types = [c["conflict_type"] for c in summary_after["conflicts"]]
+        self.assertIn(HANDOVER_CONFLICT_REIMPORT, conflict_types)
+
+        resume_result = playback.resume_export(package_id, "alice")
+        self.assertFalse(resume_result["success"])
+        self.assertIn("conflicts", resume_result)
+
+        resume_forced = playback.resume_export(package_id, "alice", force=True)
+        self.assertTrue(resume_forced["success"])
+
+        timeline = playback.get_detailed_timeline(package_id=package_id)
+        resume_events = [e for e in timeline if e["event_type"] == HANDOVER_EVENT_RESUME_EXPORT]
+        self.assertGreaterEqual(len(resume_events), 2)
+
+        failed_event = next((e for e in timeline
+                             if e["event_type"] == HANDOVER_EVENT_RESUME_EXPORT
+                             and e["status"] == "failed"), None)
+        self.assertIsNotNone(failed_event)
+
+        success_event = next((e for e in timeline
+                              if e["event_type"] == HANDOVER_EVENT_RESUME_EXPORT
+                              and e["status"] == "success"), None)
+        self.assertIsNotNone(success_event)
+
+
+class TestHandoverExportNotWritableAcceptance(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_csv = os.path.join(self.test_dir, "invoices.csv")
+        self.payment_csv = os.path.join(self.test_dir, "payments.csv")
+
+        with open(self.invoice_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_CSV)
+        with open(self.payment_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_CSV)
+
+        self.db = Database(self.db_path)
+        self.importer = CSVImporter(self.config, self.db)
+        self.matcher = MatchEngine(self.config, self.db, None)
+        self.workbench = BatchWorkbench(self.config, self.db)
+        self.handover = BatchHandover(self.config, self.db)
+        self.playback = HandoverPlaybackCenter(self.config, self.db)
+
+        inv_result = self.importer.import_invoices(self.invoice_csv, "init_user")
+        self.importer.import_payments(self.payment_csv, "init_user")
+        self.inv_batch_id = inv_result["batch_id"]
+        self.matcher.run_auto_matching("init_user")
+
+    def tearDown(self):
+        if os.path.exists(self.export_dir):
+            for root, dirs, files in os.walk(self.export_dir):
+                for f in files:
+                    os.chmod(os.path.join(root, f), stat.S_IWRITE | stat.S_IREAD)
+                for d in dirs:
+                    os.chmod(os.path.join(root, d), stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+            os.chmod(self.export_dir, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_export_not_writable_detected_in_summary(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="writable test")
+        package_id = pkg_result["package_id"]
+
+        mock_status = {
+            "export_path": self.export_dir,
+            "exists": True,
+            "is_dir": True,
+            "is_writable": False,
+            "file_count": 0,
+            "files": [],
+            "total_size": 0,
+        }
+        with patch.object(self.playback, '_check_export_file_status', return_value=mock_status):
+            summary = self.playback.get_session_summary(package_id, "alice")
+            self.assertTrue(summary["success"])
+
+            file_status = summary["file_status"]
+            self.assertFalse(file_status["is_writable"])
+
+            actions = summary["available_actions"]
+            export_json_action = next((a for a in actions if a["action_id"] == "export_json"), None)
+            self.assertIsNotNone(export_json_action)
+            self.assertFalse(export_json_action["enabled"])
+
+    def test_resume_export_blocked_when_not_writable(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="not writable")
+        package_id = pkg_result["package_id"]
+
+        mock_status = {
+            "export_path": self.export_dir,
+            "exists": True,
+            "is_dir": True,
+            "is_writable": False,
+            "file_count": 0,
+            "files": [],
+            "total_size": 0,
+        }
+        with patch.object(self.playback, '_check_export_file_status', return_value=mock_status):
+            result = self.playback.resume_export(package_id, "alice")
+            self.assertFalse(result["success"])
+
+    def test_event_recorded_for_failed_export(self):
+        self.workbench.save_last_selected_batch(self.inv_batch_id, "alice")
+        self.workbench.save_filters(operator="alice", status=MATCH_STATUS_PENDING)
+
+        pkg_result = self.handover.create_package("alice", description="failed event test")
+        package_id = pkg_result["package_id"]
+
+        mock_status = {
+            "export_path": self.export_dir,
+            "exists": True,
+            "is_dir": True,
+            "is_writable": False,
+            "file_count": 0,
+            "files": [],
+            "total_size": 0,
+        }
+        with patch.object(self.playback, '_check_export_file_status', return_value=mock_status):
+            try:
+                self.playback.resume_export(package_id, "alice")
+            except Exception:
+                pass
+
+        timeline = self.playback.get_detailed_timeline(package_id=package_id)
+        failed_events = [e for e in timeline if e["status"] == "failed"]
+        self.assertGreater(len(failed_events), 0)
 
 
 if __name__ == "__main__":

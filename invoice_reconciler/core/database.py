@@ -388,6 +388,25 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_handover_undos_package ON handover_undos(package_id);
                 CREATE INDEX IF NOT EXISTS idx_handover_undos_id ON handover_undos(undo_id);
+
+                CREATE TABLE IF NOT EXISTS handover_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT UNIQUE NOT NULL,
+                    event_type TEXT NOT NULL,
+                    package_id TEXT,
+                    operator TEXT,
+                    status TEXT NOT NULL DEFAULT 'success',
+                    result_summary TEXT,
+                    event_details TEXT,
+                    error_message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (package_id) REFERENCES handover_packages(package_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_handover_events_id ON handover_events(event_id);
+                CREATE INDEX IF NOT EXISTS idx_handover_events_package ON handover_events(package_id);
+                CREATE INDEX IF NOT EXISTS idx_handover_events_type ON handover_events(event_type);
+                CREATE INDEX IF NOT EXISTS idx_handover_events_created ON handover_events(created_at);
             """)
 
     @staticmethod
@@ -2066,6 +2085,7 @@ class Database:
 
     def delete_handover_package(self, package_id: str) -> None:
         with self._get_conn() as conn:
+            conn.execute("DELETE FROM handover_events WHERE package_id = ?", (package_id,))
             conn.execute("DELETE FROM handover_undos WHERE package_id = ?", (package_id,))
             conn.execute("DELETE FROM handover_packages WHERE package_id = ?", (package_id,))
 
@@ -2114,6 +2134,7 @@ class Database:
 
     def log_handover_event(self, event_type: str, package_id: Optional[str],
                            operator: str, details: str) -> None:
+        event_id = self._generate_handover_event_id()
         with self._get_conn() as conn:
             conn.execute(
                 """INSERT INTO audit_logs (action_type, action_category, operator, action_summary, action_details)
@@ -2122,3 +2143,81 @@ class Database:
                  f"交接包 {package_id or '-'}: {event_type}",
                  details)
             )
+            conn.execute(
+                """INSERT INTO handover_events
+                   (event_id, event_type, package_id, operator, status, result_summary, event_details)
+                   VALUES (?, ?, ?, ?, 'success', ?, ?)""",
+                (event_id, event_type, package_id, operator,
+                 f"交接包 {package_id or '-'}: {event_type}",
+                 details)
+            )
+
+    def _generate_handover_event_id(self) -> str:
+        now = datetime.now()
+        prefix = f"HE{now.strftime('%Y%m%d%H%M%S')}"
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM handover_events WHERE event_id LIKE ?",
+                (prefix + "%",)
+            ).fetchone()
+            seq = row[0] + 1
+            return f"{prefix}{seq:03d}"
+
+    def insert_handover_event(self, event_type: str, package_id: str = None,
+                              operator: str = None, status: str = "success",
+                              result_summary: str = None, event_details: Dict = None,
+                              error_message: str = None) -> str:
+        event_id = self._generate_handover_event_id()
+        details_str = json.dumps(event_details, ensure_ascii=False, default=str) if event_details else None
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO handover_events
+                   (event_id, event_type, package_id, operator, status,
+                    result_summary, event_details, error_message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (event_id, event_type, package_id, operator, status,
+                 result_summary, details_str, error_message)
+            )
+        return event_id
+
+    def get_handover_event(self, event_id: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM handover_events WHERE event_id = ?",
+                (event_id,)
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            if result.get("event_details"):
+                try:
+                    result["event_details"] = json.loads(result["event_details"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return result
+
+    def list_handover_events(self, package_id: str = None,
+                             event_type: str = None,
+                             limit: int = 100) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = "SELECT * FROM handover_events WHERE 1=1"
+            params = []
+            if package_id:
+                sql += " AND package_id = ?"
+                params.append(package_id)
+            if event_type:
+                sql += " AND event_type = ?"
+                params.append(event_type)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict.get("event_details"):
+                    try:
+                        row_dict["event_details"] = json.loads(row_dict["event_details"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                result.append(row_dict)
+            return result

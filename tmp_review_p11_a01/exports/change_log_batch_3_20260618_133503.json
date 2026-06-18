@@ -1,0 +1,60 @@
+{
+  "export_info": {
+    "exported_at": "2026-06-18T13:35:03.064876",
+    "exported_by": "reviewer_b",
+    "batch_id": 3,
+    "file_name": "review_invoices_v2.csv",
+    "file_type": "发票",
+    "imported_at": "2026-06-18 05:34:50",
+    "imported_by": "reviewer_b",
+    "total_changes": 1,
+    "filter_note": "变更类型=金额变更",
+    "applied_filters": {
+      "batch_id": 3,
+      "change_type": "amount_change"
+    },
+    "hit_count": 1,
+    "export_note": "导出内容与 `batch changes` 命令筛选条件完全一致，包含变更前后摘要、导入来源、操作者、时间、关联批次、处理状态、冲突原因",
+    "cli_command_tip": "可执行: reconciler batch changes --batch-id 3 --change-type amount_change 查看 CLI 输出"
+  },
+  "summary": {
+    "by_type": {
+      "amount_change": 1
+    },
+    "by_impact": {
+      "affects_pending": 1
+    },
+    "by_status": {
+      "pending": 1
+    },
+    "conflict_count": 0,
+    "total_changes": 1
+  },
+  "change_logs": [
+    {
+      "日志ID": 2,
+      "批次ID": 3,
+      "来源文件": "review_invoices_v2.csv",
+      "变更类型": "金额变更",
+      "记录类型": "发票",
+      "记录编号": "INV004",
+      "变更字段": "amount",
+      "原值": "12500.00",
+      "新值": "13000.00",
+      "变更摘要": "发票 INV004 金额从 12500.00 变为 13000.00，差额 500.00",
+      "变更前摘要": "发票号: INV004, 客户: 深圳市电子有限公司, 日期: 2024-02-10, 金额: 12500.00, 状态: normal, 匹配状态: unmatched",
+      "变更后摘要": "发票号: INV004, 客户: 深圳市电子有限公司, 日期: 2024-02-10, 金额: 13000.00, 状态: normal, 匹配状态: unmatched",
+      "影响类型": "影响待确认",
+      "影响详情": "匹配 #M202606180003 待确认，变更后可能需要重新匹配",
+      "影响的匹配ID": "3",
+      "是否有冲突": "否",
+      "冲突原因": "-",
+      "处理状态": "待处理",
+      "操作者": "reviewer_b",
+      "检测时间": "2026-06-18 05:34:51",
+      "处理时间": "-",
+      "处理人": "-",
+      "备注": "-"
+    }
+  ]
+}

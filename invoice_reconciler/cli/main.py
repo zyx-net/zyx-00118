@@ -50,6 +50,7 @@ from invoice_reconciler.core.change_tracker import (
 )
 from invoice_reconciler.core.handover import (
     BatchHandover,
+    HandoverPlaybackCenter,
     HANDOVER_STATUS_ACTIVE,
     HANDOVER_STATUS_DISCARDED,
     HANDOVER_STATUS_RESTORED,
@@ -59,7 +60,12 @@ from invoice_reconciler.core.handover import (
     HANDOVER_EVENT_DISCARD,
     HANDOVER_EVENT_SAVE_COPY,
     HANDOVER_EVENT_CLEANUP,
+    HANDOVER_EVENT_EXPORT_PACKAGE,
+    HANDOVER_EVENT_RESUME_EXPORT,
+    HANDOVER_EVENT_VIEW_SUMMARY,
+    HANDOVER_EVENT_LABELS,
     HANDOVER_CONFLICT_LABELS,
+    HANDOVER_ACTION_LABELS,
 )
 
 
@@ -110,6 +116,7 @@ def cli(ctx, config_path):
             ))
         workbench = BatchWorkbench(config, db)
         handover = BatchHandover(config, db)
+        playback_center = HandoverPlaybackCenter(config, db)
         active_packages = handover.list_packages()
         if active_packages:
             latest_pkg = active_packages[0]
@@ -211,6 +218,7 @@ def cli(ctx, config_path):
             "workbench": workbench,
             "change_tracker": ChangeTracker(config, db),
             "handover": handover,
+            "playback_center": playback_center,
         }
     except Exception as e:
         click.echo(f"初始化失败: {e}", err=True)
@@ -2660,6 +2668,249 @@ def handover_timeline(ctx, package_id, limit):
         op = evt.get("operator", "-")
         ts = evt.get("timestamp", "-")
         click.echo(f"  [{ts}] {evt_label} | 交接包: {pkg} | 操作人: {op}")
+
+
+@handover.command("session-summary")
+@click.argument("package_id")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def handover_session_summary(ctx, package_id, operator):
+    """查看交接会话摘要（筛选条件、导出状态、文件状态、可用动作）"""
+    playback = ctx.obj["playback_center"]
+    operator = operator or get_current_user()
+
+    result = playback.get_session_summary(package_id, operator)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    summary = result["summary"]
+    conflicts = result["conflicts"]
+    file_status = result["file_status"]
+    available_actions = result["available_actions"]
+
+    click.echo(click.style(f"=== 交接会话摘要: {package_id} ===", fg="cyan", bold=True))
+    click.echo(f"状态: {result['package_status']} | 操作人: {result.get('operator', '-')} | 创建时间: {result.get('created_at', '-')}")
+    if result.get("description"):
+        click.echo(f"描述: {result['description']}")
+    click.echo()
+
+    click.echo(click.style("--- 筛选条件 ---", fg="yellow"))
+    filters = summary.get("filters", {})
+    filter_parts = []
+    if filters.get("operator"):
+        filter_parts.append(f"处理人: {filters['operator']}")
+    if filters.get("status"):
+        filter_parts.append(f"状态: {STATUS_LABELS.get(filters['status'], filters['status'])}")
+    if filters.get("impact_filter"):
+        filter_parts.append(f"影响类型: {filters['impact_filter']}")
+    if filters.get("with_conflicts_only"):
+        filter_parts.append("仅含冲突")
+    if filters.get("change_type"):
+        filter_parts.append(f"变更类型: {CHANGE_TYPE_LABELS.get(filters['change_type'], filters['change_type'])}")
+    if filters.get("impact_type"):
+        filter_parts.append(f"影响类型: {IMPACT_TYPE_LABELS.get(filters['impact_type'], filters['impact_type'])}")
+    if filters.get("processing_status"):
+        filter_parts.append(f"处理状态: {PROCESSING_STATUS_LABELS.get(filters['processing_status'], filters['processing_status'])}")
+
+    if filter_parts:
+        click.echo(f"  已应用筛选: {', '.join(filter_parts)}")
+    else:
+        click.echo(click.style("  ⚠ 无筛选条件（全量视图）", fg="red"))
+
+    if summary.get("is_full_view"):
+        click.echo(click.style("  警告：恢复后将回到全量视图", fg="red", bold=True))
+    click.echo()
+
+    click.echo(click.style("--- 导出摘要 ---", fg="yellow"))
+    if summary.get("export_type"):
+        click.echo(f"  导出类型: {summary['export_type']}")
+        click.echo(f"  导出格式: {summary.get('export_format', '-')}")
+        click.echo(f"  导出路径: {summary.get('export_path', '-')}")
+        if summary.get("exported_at"):
+            click.echo(f"  导出时间: {summary['exported_at']}")
+        if summary.get("hit_count") is not None:
+            click.echo(f"  记录数: {summary['hit_count']}")
+    else:
+        click.echo("  暂无导出记录")
+    click.echo()
+
+    click.echo(click.style("--- 文件状态 ---", fg="yellow"))
+    click.echo(f"  路径: {file_status['export_path']}")
+    click.echo(f"  存在: {'是' if file_status['exists'] else '否'}")
+    click.echo(f"  可写: {'是' if file_status['is_writable'] else '否'}")
+    if file_status.get("file_count"):
+        click.echo(f"  文件数: {file_status['file_count']}")
+        click.echo(f"  总大小: {file_status['total_size']} bytes")
+    click.echo()
+
+    if conflicts:
+        click.echo(click.style("--- 冲突检测 ---", fg="red", bold=True))
+        for c in conflicts:
+            ct_label = HANDOVER_CONFLICT_LABELS.get(c["conflict_type"], c["conflict_type"])
+            click.echo(click.style(f"  • [{ct_label}] {c.get('detail', c.get('message', ''))}", fg="red"))
+        click.echo()
+
+    click.echo(click.style("--- 可用动作 ---", fg="green"))
+    for action in available_actions:
+        status_icon = "✓" if action.get("enabled") else "✗"
+        status_color = "green" if action.get("enabled") else "yellow"
+        warning = ""
+        if action.get("warning"):
+            warning = f" ({action['warning']})"
+        danger = ""
+        if action.get("dangerous"):
+            danger = " [危险]"
+        requires_confirm = ""
+        if action.get("requires_confirmation"):
+            requires_confirm = " [需确认]"
+        click.echo(click.style(
+            f"  {status_icon} {action['label']}{warning}{danger}{requires_confirm}",
+            fg=status_color
+        ))
+        click.echo(f"     {action['description']}")
+    click.echo()
+
+    if summary.get("is_full_view"):
+        click.echo(click.style(
+            "⚠ 重要：此交接包无筛选条件，恢复后将回到全量视图。"
+            "建议先设置筛选条件后重新创建交接包。",
+            fg="red", bold=True
+        ))
+
+
+@handover.command("resume-export")
+@click.argument("package_id")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--force", is_flag=True, default=False, help="强制续导出（忽略冲突和全量视图警告）")
+@click.pass_context
+def handover_resume_export(ctx, package_id, operator, force):
+    """续导出：恢复交接包并继续导出（需确认筛选条件）"""
+    playback = ctx.obj["playback_center"]
+    operator = operator or get_current_user()
+
+    result = playback.resume_export(package_id, operator, force=force)
+
+    if not result["success"]:
+        if result.get("warning") == "full_view_fallback":
+            click.echo(click.style("[!!] 无筛选条件，恢复后将回到全量视图", fg="red", bold=True), err=True)
+            click.echo(click.style(result["message"], fg="red"), err=True)
+            click.echo()
+            summary = result.get("summary", {})
+            if summary:
+                click.echo("当前筛选状态:")
+                if summary.get("is_full_view"):
+                    click.echo("  全量视图（无筛选条件）")
+        elif result.get("conflicts"):
+            click.echo(click.style(f"[!!] 存在 {len(result['conflicts'])} 个冲突，无法续导出:", fg="red", bold=True), err=True)
+            for c in result["conflicts"]:
+                ct_label = HANDOVER_CONFLICT_LABELS.get(c["conflict_type"], c["conflict_type"])
+                click.echo(click.style(f"  • [{ct_label}] {c.get('detail', c.get('message', ''))}", fg="red"))
+            click.echo()
+            click.echo(click.style("使用 --force 强制续导出，或先解决冲突", fg="yellow"))
+        elif result.get("file_status"):
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 续导出完成: {package_id}", fg="green", bold=True))
+    click.echo(f"撤销ID: {result.get('undo_id', '-')}")
+    click.echo(f"已恢复项: {', '.join(result.get('applied', []))}")
+    click.echo()
+
+    export_result = result.get("export_result", {})
+    if export_result.get("success"):
+        click.echo(click.style("--- 导出结果 ---", fg="green"))
+        click.echo(f"  文件路径: {export_result.get('file_path', '-')}")
+        click.echo(f"  格式: {export_result.get('format', '-')}")
+        if export_result.get("total_changes") is not None:
+            click.echo(f"  记录数: {export_result['total_changes']}")
+    else:
+        click.echo(click.style("--- 导出结果 ---", fg="yellow"))
+        click.echo(f"  状态: 部分成功")
+        click.echo(f"  导出信息: {export_result.get('message', '未知')}")
+
+    if result.get("conflicts"):
+        click.echo()
+        click.echo(click.style("⚠ 恢复过程中检测到冲突（已强制跳过）:", fg="yellow"))
+        for c in result["conflicts"]:
+            ct_label = HANDOVER_CONFLICT_LABELS.get(c["conflict_type"], c["conflict_type"])
+            click.echo(f"  • [{ct_label}] {c.get('detail', c.get('message', ''))}")
+
+
+@handover.command("export-package")
+@click.argument("package_id")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--target-dir", default=None, help="目标导出目录")
+@click.option("--format", "export_format", type=click.Choice(["json", "csv"]),
+              default="json", help="数据导出格式")
+@click.pass_context
+def handover_export_package(ctx, package_id, operator, target_dir, export_format):
+    """导出交接包为独立目录（含元数据、筛选条件、数据文件）"""
+    playback = ctx.obj["playback_center"]
+    operator = operator or get_current_user()
+
+    result = playback.export_handover_package(
+        package_id, operator, target_dir=target_dir, format=export_format
+    )
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 交接包已导出: {package_id}", fg="green", bold=True))
+    click.echo(f"导出路径: {result['export_path']}")
+    click.echo(f"格式: {result['format']}")
+    click.echo(f"包含文件:")
+    for f in result["files"]:
+        click.echo(f"  - {f}")
+    if not result.get("has_active_filters"):
+        click.echo()
+        click.echo(click.style("⚠ 注意：此交接包无筛选条件（全量视图）", fg="yellow"))
+
+
+@handover.command("detailed-timeline")
+@click.option("--package-id", default=None, help="指定交接包ID")
+@click.option("--limit", type=int, default=50, help="显示条数")
+@click.pass_context
+def handover_detailed_timeline(ctx, package_id, limit):
+    """查看详细操作时间线（含事件结果和错误信息）"""
+    playback = ctx.obj["playback_center"]
+
+    events = playback.get_detailed_timeline(package_id=package_id, limit=limit)
+
+    if not events:
+        click.echo("暂无操作记录")
+        return
+
+    click.echo(click.style("=== 详细操作时间线 ===", fg="cyan", bold=True))
+    for evt in events:
+        status_icon = "✓" if evt["status"] == "success" else ("⚠" if evt["status"] == "partial" else "✗")
+        status_color = "green" if evt["status"] == "success" else ("yellow" if evt["status"] == "partial" else "red")
+
+        click.echo(click.style(
+            f"  [{evt['timestamp']}] {status_icon} {evt['event_type_label']}",
+            fg=status_color
+        ))
+        click.echo(f"     事件ID: {evt['event_id']}")
+        if evt.get("package_id"):
+            click.echo(f"     交接包: {evt['package_id']}")
+        if evt.get("operator"):
+            click.echo(f"     操作人: {evt['operator']}")
+        if evt.get("result_summary"):
+            click.echo(f"     结果: {evt['result_summary']}")
+        if evt.get("error_message"):
+            click.echo(click.style(f"     错误: {evt['error_message']}", fg="red"))
+        if evt.get("event_details"):
+            details = evt["event_details"]
+            if isinstance(details, dict):
+                detail_str = ", ".join(f"{k}={v}" for k, v in list(details.items())[:5])
+                click.echo(f"     详情: {detail_str}")
+            else:
+                click.echo(f"     详情: {str(details)[:80]}")
+        click.echo()
 
 
 if __name__ == "__main__":
