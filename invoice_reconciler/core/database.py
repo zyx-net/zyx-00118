@@ -359,6 +359,35 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_operator ON audit_logs(operator);
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_category ON audit_logs(action_category);
                 CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
+
+                CREATE TABLE IF NOT EXISTS handover_packages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    package_id TEXT UNIQUE NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    operator TEXT,
+                    description TEXT,
+                    package_data TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_handover_packages_id ON handover_packages(package_id);
+                CREATE INDEX IF NOT EXISTS idx_handover_packages_config ON handover_packages(config_hash);
+                CREATE INDEX IF NOT EXISTS idx_handover_packages_status ON handover_packages(status);
+
+                CREATE TABLE IF NOT EXISTS handover_undos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    undo_id TEXT UNIQUE NOT NULL,
+                    package_id TEXT NOT NULL,
+                    previous_state TEXT NOT NULL,
+                    operator TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (package_id) REFERENCES handover_packages(package_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_handover_undos_package ON handover_undos(package_id);
+                CREATE INDEX IF NOT EXISTS idx_handover_undos_id ON handover_undos(undo_id);
             """)
 
     @staticmethod
@@ -1977,3 +2006,119 @@ class Database:
                      ORDER BY cl.detected_at ASC"""
             rows = conn.execute(sql, (record_type, record_no, field_name, batch_id)).fetchall()
             return [dict(r) for r in rows]
+
+    def save_handover_package(self, package_id: str, config_hash: str,
+                              package_data: Dict) -> None:
+        data_str = json.dumps(package_data, ensure_ascii=False, default=str)
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO handover_packages (package_id, config_hash, status, operator, description, package_data, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(package_id) DO UPDATE SET
+                   config_hash = excluded.config_hash,
+                   status = excluded.status,
+                   operator = excluded.operator,
+                   description = excluded.description,
+                   package_data = excluded.package_data,
+                   updated_at = CURRENT_TIMESTAMP""",
+                (package_id, config_hash,
+                 package_data.get("status", "active"),
+                 package_data.get("operator"),
+                 package_data.get("description"),
+                 data_str)
+            )
+
+    def get_handover_package(self, package_id: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM handover_packages WHERE package_id = ?",
+                (package_id,)
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            if result.get("package_data"):
+                try:
+                    result["package_data"] = json.loads(result["package_data"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return result
+
+    def list_handover_packages(self, config_hash: str,
+                               include_discarded: bool = False) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = "SELECT * FROM handover_packages WHERE config_hash = ?"
+            params = [config_hash]
+            if not include_discarded:
+                sql += " AND status != 'discarded'"
+            sql += " ORDER BY created_at DESC"
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict.get("package_data"):
+                    try:
+                        row_dict["package_data"] = json.loads(row_dict["package_data"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                result.append(row_dict)
+            return result
+
+    def delete_handover_package(self, package_id: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM handover_undos WHERE package_id = ?", (package_id,))
+            conn.execute("DELETE FROM handover_packages WHERE package_id = ?", (package_id,))
+
+    def save_handover_undo(self, undo_id: str, package_id: str,
+                           previous_state: Dict, operator: str) -> None:
+        state_str = json.dumps(previous_state, ensure_ascii=False, default=str)
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO handover_undos (undo_id, package_id, previous_state, operator)
+                   VALUES (?, ?, ?, ?)""",
+                (undo_id, package_id, state_str, operator)
+            )
+
+    def get_handover_undo(self, undo_id: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM handover_undos WHERE undo_id = ?",
+                (undo_id,)
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            if result.get("previous_state"):
+                try:
+                    result["previous_state"] = json.loads(result["previous_state"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return result
+
+    def list_handover_undos(self, package_id: str) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM handover_undos WHERE package_id = ? ORDER BY created_at DESC",
+                (package_id,)
+            ).fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict.get("previous_state"):
+                    try:
+                        row_dict["previous_state"] = json.loads(row_dict["previous_state"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                result.append(row_dict)
+            return result
+
+    def log_handover_event(self, event_type: str, package_id: Optional[str],
+                           operator: str, details: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO audit_logs (action_type, action_category, operator, action_summary, action_details)
+                   VALUES (?, 'handover', ?, ?, ?)""",
+                (event_type, operator,
+                 f"交接包 {package_id or '-'}: {event_type}",
+                 details)
+            )

@@ -48,6 +48,19 @@ from invoice_reconciler.core.change_tracker import (
     IMPACT_TYPE_LABELS,
     PROCESSING_STATUS_LABELS,
 )
+from invoice_reconciler.core.handover import (
+    BatchHandover,
+    HANDOVER_STATUS_ACTIVE,
+    HANDOVER_STATUS_DISCARDED,
+    HANDOVER_STATUS_RESTORED,
+    HANDOVER_EVENT_CREATE,
+    HANDOVER_EVENT_RESTORE,
+    HANDOVER_EVENT_UNDO,
+    HANDOVER_EVENT_DISCARD,
+    HANDOVER_EVENT_SAVE_COPY,
+    HANDOVER_EVENT_CLEANUP,
+    HANDOVER_CONFLICT_LABELS,
+)
 
 
 def get_current_user() -> str:
@@ -96,6 +109,34 @@ def cli(ctx, config_path):
                 fg="yellow"
             ))
         workbench = BatchWorkbench(config, db)
+        handover = BatchHandover(config, db)
+        active_packages = handover.list_packages()
+        if active_packages:
+            latest_pkg = active_packages[0]
+            pkg_id = latest_pkg.get("package_id", "?")
+            pkg_desc = latest_pkg.get("description") or ""
+            pkg_operator = latest_pkg.get("operator") or "-"
+            pkg_created = latest_pkg.get("created_at", "-")
+            pkg_status = latest_pkg.get("status", "-")
+            status_labels = {
+                HANDOVER_STATUS_ACTIVE: "可用",
+                HANDOVER_STATUS_RESTORED: "已恢复",
+                HANDOVER_STATUS_DISCARDED: "已废弃",
+            }
+            pkg_status_label = status_labels.get(pkg_status, pkg_status)
+            click.echo(click.style(
+                f"[交接包] 检测到可恢复的交接包: {pkg_id} "
+                f"(状态: {pkg_status_label}, 操作人: {pkg_operator}, "
+                f"时间: {pkg_created})"
+                + (f" - {pkg_desc}" if pkg_desc else ""),
+                fg="magenta", bold=True
+            ))
+            click.echo(click.style(
+                f"  预览: handover preview {pkg_id}  |  "
+                f"恢复: handover restore {pkg_id}  |  "
+                f"废弃: handover discard {pkg_id}",
+                fg="magenta"
+            ))
         restore_workbench = workbench.restore_workbench_state()
         if restore_workbench.get("restored") and restore_workbench.get("last_batch"):
             lb = restore_workbench["last_batch"]
@@ -169,6 +210,7 @@ def cli(ctx, config_path):
             "reviewer": ReviewSnapshot(db),
             "workbench": workbench,
             "change_tracker": ChangeTracker(config, db),
+            "handover": handover,
         }
     except Exception as e:
         click.echo(f"初始化失败: {e}", err=True)
@@ -2298,6 +2340,326 @@ def batch_list(ctx, show_all):
             b["imported_at"],
         ])
     print_table(headers, rows)
+
+
+@cli.group()
+def handover():
+    """批次交接包管理"""
+    pass
+
+
+@handover.command("create")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--batch-id", type=int, default=None, help="指定批次ID")
+@click.option("--description", default=None, help="交接包描述")
+@click.pass_context
+def handover_create(ctx, operator, batch_id, description):
+    """创建批次交接包"""
+    handover_mgr = ctx.obj["handover"]
+    operator = operator or get_current_user()
+
+    result = handover_mgr.create_package(operator, batch_id=batch_id, description=description)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] 创建失败", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 交接包已创建: {result['package_id']}", fg="green"))
+    click.echo(f"配置哈希: {result['config_hash']}")
+    click.echo(f"状态: {result['status']}")
+    click.echo(f"创建时间: {result['created_at']}")
+    if description:
+        click.echo(f"描述: {description}")
+
+
+@handover.command("list")
+@click.option("--all", "show_all", is_flag=True, help="包含已废弃的交接包")
+@click.pass_context
+def handover_list(ctx, show_all):
+    """列出交接包"""
+    handover_mgr = ctx.obj["handover"]
+
+    packages = handover_mgr.list_packages(include_discarded=show_all)
+
+    if not packages:
+        click.echo("暂无交接包")
+        return
+
+    status_labels = {
+        HANDOVER_STATUS_ACTIVE: "可用",
+        HANDOVER_STATUS_RESTORED: "已恢复",
+        HANDOVER_STATUS_DISCARDED: "已废弃",
+    }
+
+    headers = ["交接包ID", "状态", "操作人", "描述", "创建时间"]
+    rows = []
+    for p in packages:
+        rows.append([
+            p.get("package_id", "-"),
+            status_labels.get(p.get("status"), p.get("status", "-")),
+            p.get("operator") or "-",
+            (p.get("description") or "")[:30],
+            p.get("created_at", "-"),
+        ])
+    print_table(headers, rows)
+
+
+@handover.command("preview")
+@click.argument("package_id")
+@click.pass_context
+def handover_preview(ctx, package_id):
+    """预览交接包（恢复前查看）"""
+    handover_mgr = ctx.obj["handover"]
+
+    result = handover_mgr.preview_package(package_id)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    preview = result["preview"]
+    click.echo(click.style(f"=== 交接包预览: {package_id} ===", fg="cyan", bold=True))
+    click.echo(f"状态: {preview['status']} | 操作人: {preview.get('operator', '-')} | 创建时间: {preview.get('created_at', '-')}")
+    if preview.get("description"):
+        click.echo(f"描述: {preview['description']}")
+    click.echo()
+
+    if preview.get("will_restore_batch") and preview.get("batch_info"):
+        bi = preview["batch_info"]
+        click.echo(click.style("[批次]", fg="cyan") + f" 将恢复批次: #{bi.get('batch_id', '-')} - {bi.get('file_name', '-')}")
+    else:
+        click.echo(click.style("[批次]", fg="yellow") + " 无批次信息")
+
+    if preview.get("will_restore_filters") and preview.get("filters"):
+        filters = preview["filters"]
+        parts = []
+        if filters.get("operator"):
+            parts.append(f"处理人: {filters['operator']}")
+        if filters.get("status"):
+            parts.append(f"状态: {STATUS_LABELS.get(filters['status'], filters['status'])}")
+        click.echo(click.style("[筛选]", fg="cyan") + f" 将恢复筛选: {', '.join(parts)}")
+    else:
+        click.echo(click.style("[筛选]", fg="yellow") + " 无筛选条件")
+
+    if preview.get("will_restore_change_view") and preview.get("change_view_context"):
+        cv = preview["change_view_context"]
+        parts = []
+        if cv.get("change_type"):
+            parts.append(f"变更类型: {CHANGE_TYPE_LABELS.get(cv['change_type'], cv['change_type'])}")
+        if cv.get("impact_type"):
+            parts.append(f"影响类型: {IMPACT_TYPE_LABELS.get(cv['impact_type'], cv['impact_type'])}")
+        click.echo(click.style("[变更视图]", fg="cyan") + f" 将恢复: {', '.join(parts) if parts else '全部'}")
+    else:
+        click.echo(click.style("[变更视图]", fg="yellow") + " 无变更视图上下文")
+
+    if preview.get("will_restore_export") and preview.get("export_context"):
+        ec = preview["export_context"]
+        click.echo(click.style("[导出]", fg="cyan") + f" 将恢复导出上下文: 批次 #{ec.get('batch_id', '-')} ({ec.get('export_type', '-')}, {ec.get('format', '-')})")
+    else:
+        click.echo(click.style("[导出]", fg="yellow") + " 无导出上下文")
+
+    if preview.get("has_conflicts"):
+        click.echo()
+        click.echo(click.style("⚠ 冲突检测:", fg="red", bold=True))
+        for c in preview["conflicts"]:
+            ct_label = HANDOVER_CONFLICT_LABELS.get(c["conflict_type"], c["conflict_type"])
+            click.echo(click.style(f"  • [{ct_label}] {c.get('detail', c.get('message', ''))}", fg="red"))
+        click.echo()
+        click.echo(click.style("使用 --force 强制恢复", fg="yellow"))
+
+
+@handover.command("restore")
+@click.argument("package_id")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--force", is_flag=True, default=False, help="强制恢复（忽略冲突）")
+@click.pass_context
+def handover_restore(ctx, package_id, operator, force):
+    """恢复交接包"""
+    handover_mgr = ctx.obj["handover"]
+    operator = operator or get_current_user()
+
+    result = handover_mgr.restore_package(package_id, operator, force=force)
+
+    if not result["success"]:
+        if result.get("conflicts"):
+            click.echo(click.style(f"[!!] 存在冲突，无法恢复:", fg="red", bold=True))
+            for c in result["conflicts"]:
+                ct_label = HANDOVER_CONFLICT_LABELS.get(c["conflict_type"], c["conflict_type"])
+                click.echo(click.style(f"  • [{ct_label}] {c.get('detail', c.get('message', ''))}", fg="red"))
+            click.echo()
+            click.echo(click.style("使用 --force 强制恢复，或先解决冲突", fg="yellow"))
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 交接包已恢复: {package_id}", fg="green"))
+    click.echo(f"撤销ID: {result['undo_id']}")
+    click.echo(f"已恢复项: {', '.join(result.get('applied', []))}")
+
+    if result.get("conflicts"):
+        click.echo()
+        click.echo(click.style("⚠ 恢复过程中检测到冲突（已强制跳过）:", fg="yellow"))
+        for c in result["conflicts"]:
+            ct_label = HANDOVER_CONFLICT_LABELS.get(c["conflict_type"], c["conflict_type"])
+            click.echo(f"  • [{ct_label}] {c.get('detail', c.get('message', ''))}")
+
+
+@handover.command("diff")
+@click.argument("package_id")
+@click.pass_context
+def handover_diff(ctx, package_id):
+    """查看交接包与当前状态的差异"""
+    handover_mgr = ctx.obj["handover"]
+
+    result = handover_mgr.diff_package(package_id)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    if result["no_change"]:
+        click.echo(click.style("[OK] 当前状态与交接包一致，无差异", fg="green"))
+        return
+
+    click.echo(click.style(f"=== 交接包差异: {package_id} ({result['change_count']} 处) ===", fg="cyan", bold=True))
+
+    field_labels = {
+        "last_selected_batch": "选中批次",
+        "filters": "筛选条件",
+        "change_view_context": "变更视图",
+        "export_context": "导出上下文",
+        "stats": "统计摘要",
+    }
+
+    for change in result["changes"]:
+        field = change["field"]
+        label = field_labels.get(field, field)
+        before = change["before"]
+        after = change["after"]
+        click.echo(click.style(f"\n  [{label}]", fg="yellow"))
+        if field == "last_selected_batch":
+            before_label = f"#{before.get('batch_id', '-')}" if before else "无"
+            after_label = f"#{after.get('batch_id', '-')}" if after else "无"
+            click.echo(f"    当前: {before_label} → 恢复后: {after_label}")
+        elif field == "filters":
+            before_parts = [f"{k}={v}" for k, v in (before or {}).items() if v is not None] or ["无"]
+            after_parts = [f"{k}={v}" for k, v in (after or {}).items() if v is not None] or ["无"]
+            click.echo(f"    当前: {', '.join(before_parts)}")
+            click.echo(f"    恢复后: {', '.join(after_parts)}")
+        else:
+            click.echo(f"    当前: {json.dumps(before, ensure_ascii=False)[:80] if before else '无'}")
+            click.echo(f"    恢复后: {json.dumps(after, ensure_ascii=False)[:80] if after else '无'}")
+
+
+@handover.command("undo")
+@click.argument("undo_id")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def handover_undo(ctx, undo_id, operator):
+    """撤销交接包恢复"""
+    handover_mgr = ctx.obj["handover"]
+    operator = operator or get_current_user()
+
+    result = handover_mgr.undo_restore(undo_id, operator)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 已撤销恢复: {undo_id}", fg="green"))
+    click.echo(f"交接包: {result.get('package_id', '-')}")
+    click.echo(f"已恢复项: {', '.join(result.get('applied', []))}")
+
+
+@handover.command("save-copy")
+@click.argument("package_id")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--description", default=None, help="新描述")
+@click.pass_context
+def handover_save_copy(ctx, package_id, operator, description):
+    """另存交接包副本"""
+    handover_mgr = ctx.obj["handover"]
+    operator = operator or get_current_user()
+
+    result = handover_mgr.save_as_copy(package_id, operator, description=description)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 已创建副本: {result['new_package_id']}", fg="green"))
+    click.echo(f"原始: {result['original_package_id']}")
+    click.echo(f"描述: {result['description']}")
+
+
+@handover.command("discard")
+@click.argument("package_id")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def handover_discard(ctx, package_id, operator):
+    """废弃交接包（不删除，保留审计记录）"""
+    handover_mgr = ctx.obj["handover"]
+    operator = operator or get_current_user()
+
+    result = handover_mgr.discard_package(package_id, operator)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 交接包已废弃: {package_id}", fg="yellow"))
+
+
+@handover.command("cleanup")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def handover_cleanup(ctx, operator):
+    """清理失效的交接包记录"""
+    handover_mgr = ctx.obj["handover"]
+    operator = operator or get_current_user()
+    config_hash = handover_mgr._compute_config_hash()
+
+    result = handover_mgr.cleanup_invalid(config_hash, operator)
+
+    if result["removed_count"] > 0:
+        click.echo(click.style(f"[OK] 已清理 {result['removed_count']} 个失效记录", fg="green"))
+        for detail in result.get("invalid_details", []):
+            reasons = ", ".join(detail["reasons"])
+            click.echo(f"  • {detail['package_id']}: {reasons}")
+    else:
+        click.echo(click.style("[OK] 无失效记录", fg="green"))
+
+
+@handover.command("timeline")
+@click.option("--package-id", default=None, help="指定交接包ID")
+@click.option("--limit", type=int, default=20, help="显示条数")
+@click.pass_context
+def handover_timeline(ctx, package_id, limit):
+    """查看交接包操作时间线"""
+    handover_mgr = ctx.obj["handover"]
+
+    events = handover_mgr.get_timeline(package_id=package_id, limit=limit)
+
+    if not events:
+        click.echo("暂无操作记录")
+        return
+
+    event_labels = {
+        HANDOVER_EVENT_CREATE: "创建",
+        HANDOVER_EVENT_RESTORE: "恢复",
+        HANDOVER_EVENT_UNDO: "撤销",
+        HANDOVER_EVENT_DISCARD: "废弃",
+        HANDOVER_EVENT_SAVE_COPY: "另存副本",
+        HANDOVER_EVENT_CLEANUP: "清理",
+    }
+
+    click.echo(click.style("=== 交接包操作时间线 ===", fg="cyan", bold=True))
+    for evt in events:
+        evt_label = event_labels.get(evt["event_type"], evt["event_type"])
+        pkg = evt.get("package_id", "-")
+        op = evt.get("operator", "-")
+        ts = evt.get("timestamp", "-")
+        click.echo(f"  [{ts}] {evt_label} | 交接包: {pkg} | 操作人: {op}")
 
 
 if __name__ == "__main__":
