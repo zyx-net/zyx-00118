@@ -882,6 +882,165 @@ class TestChangeTrackingFullWorkflow(unittest.TestCase):
         self.assertTrue(pay_export["success"])
 
 
+class TestChangeTrackingHandoffDocRegression(unittest.TestCase):
+    """
+    交接文档复现链路的回归保护测试。
+    专门卡住两个容易踩的坑：
+    1. 用同一个文件做"重新导入" → 除了 duplicate_process 不会有其他变更
+    2. 记错批次号顺序 → v1发票=1、v1收款=2、v2发票=3
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.test_dir, "test.db")
+        self.export_dir = os.path.join(self.test_dir, "exports")
+
+        self.config = Config(
+            db_path=self.db_path,
+            export_dir=self.export_dir,
+            lock_timeout_seconds=3600,
+            admin_users=["admin"],
+            enable_lock=False,
+        )
+
+        self.invoice_v1 = os.path.join(self.test_dir, "invoices_v1.csv")
+        self.payment_v1 = os.path.join(self.test_dir, "payments_v1.csv")
+        self.invoice_v2 = os.path.join(self.test_dir, "invoices_v2.csv")
+
+        with open(self.invoice_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V1)
+        with open(self.payment_v1, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_PAYMENTS_V1)
+        with open(self.invoice_v2, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_V2)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_same_content_file_is_skipped(self):
+        """
+        相同内容的文件（同哈希）重复导入会直接被跳过，不会产生新批次。
+        卡住"用同一个 sample_invoices.csv 演示变更追踪"的坑——
+        接手人如果照着旧文档用同一个文件导入两遍，第二次直接被跳过，
+        连新批次都不会产生，更看不到变更日志。
+        """
+        db = Database(self.db_path)
+        importer = CSVImporter(self.config, db)
+
+        same_content_copy = os.path.join(self.test_dir, "invoices_copy.csv")
+        shutil.copyfile(self.invoice_v1, same_content_copy)
+
+        r1 = importer.import_invoices(self.invoice_v1, "op_a")
+        self.assertEqual(r1["batch_id"], 1)
+        self.assertFalse(r1.get("skipped", False))
+
+        r2 = importer.import_invoices(same_content_copy, "op_b")
+        self.assertTrue(r2.get("skipped", False),
+                        "相同内容（同文件哈希）的文件应被跳过，不产生新批次。"
+                        "这就是为什么文档示例必须用 sample_invoices_updated.csv"
+                        "而不是再导一次 sample_invoices.csv。")
+        self.assertEqual(r2["batch_id"], 1,
+                         "跳过后应复用原批次ID")
+
+        changes_after_skip = db.get_batch_change_logs()
+        self.assertEqual(len(changes_after_skip), 0,
+                         "文件被跳过意味着没有新批次，也就不会产生变更日志")
+
+        del db
+
+    def test_batch_sequence_and_full_handoff_chain(self):
+        """
+        按 v1发票 → v1收款 → v2发票 的标准交接流程导入，
+        验证 v2发票批次号为 3（文档示例用的 3），并完整跑通：
+        默认查看 → 按批次查看 → 导出 → 重启后 resume-export
+        专门卡住"batch_id 写错导致看不对批次"的坑。
+        """
+        db = Database(self.db_path)
+        workflow = WorkflowManager(self.config, db)
+        importer = CSVImporter(self.config, db)
+        matcher = MatchEngine(self.config, db, workflow)
+        tracker = ChangeTracker(self.config, db)
+        workbench = BatchWorkbench(self.config, db)
+        workbench.clear_workbench_state()
+
+        r_inv1 = importer.import_invoices(self.invoice_v1, "op_a")
+        self.assertEqual(r_inv1["batch_id"], 1, "v1发票应为批次 1")
+
+        r_pay1 = importer.import_payments(self.payment_v1, "op_a")
+        self.assertEqual(r_pay1["batch_id"], 2, "v1收款应为批次 2")
+
+        matcher.run_auto_matching("op_a")
+
+        r_inv2 = importer.import_invoices(self.invoice_v2, "op_b")
+        self.assertEqual(r_inv2["batch_id"], 3,
+                         "v2发票应为批次 3（文档示例用的就是 3，顺序错了就看不对批次）")
+
+        self.assertIn("change_count", r_inv2)
+        self.assertGreater(r_inv2["change_count"], 0)
+        changes = db.get_batch_change_logs(batch_id=r_inv2["batch_id"])
+        types_found = {c["change_type"] for c in changes}
+        self.assertIn(CHANGE_TYPE_NEW_RECORD, types_found,
+                      "更新版文件导入后应有新增记录")
+        self.assertIn(CHANGE_TYPE_STATUS_CHANGE, types_found,
+                      "更新版文件导入后应有状态变更")
+        self.assertIn(CHANGE_TYPE_AMOUNT_CHANGE, types_found,
+                      "更新版文件导入后应有金额变更")
+        self.assertIn(CHANGE_TYPE_KEY_FIELD_CHANGE, types_found,
+                      "更新版文件导入后应用关键字段变更")
+
+        summary = tracker.get_change_summary()
+        self.assertTrue(summary["success"])
+        self.assertGreater(summary["total_changes"], 0)
+
+        result_json = tracker.export_change_logs(3, "export_user", format="json")
+        self.assertTrue(result_json["success"])
+        self.assertTrue(os.path.exists(result_json["file_path"]))
+
+        with open(result_json["file_path"], "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["export_info"]["batch_id"], 3)
+        self.assertEqual(data["export_info"]["exported_by"], "export_user")
+        self.assertIn("change_logs", data)
+        self.assertGreater(len(data["change_logs"]), 0)
+
+        workbench.save_export_context(
+            batch_id=3,
+            export_type="change_logs",
+            format="json",
+            operator="export_user",
+        )
+
+        del db
+        del workflow
+        del importer
+        del matcher
+        del tracker
+        del workbench
+
+        db2 = Database(self.db_path)
+        workbench2 = BatchWorkbench(self.config, db2)
+        tracker2 = ChangeTracker(self.config, db2)
+
+        export_ctx = workbench2.get_last_export_context()
+        self.assertIsNotNone(export_ctx, "重启后应能恢复导出上下文")
+        self.assertEqual(export_ctx["batch_id"], 3)
+        self.assertEqual(export_ctx["format"], "json")
+
+        result_resume = tracker2.export_change_logs(
+            export_ctx["batch_id"], "resume_user", format=export_ctx["format"]
+        )
+        self.assertTrue(result_resume["success"],
+                        "用恢复的上下文继续导出应成功")
+        self.assertTrue(os.path.exists(result_resume["file_path"]))
+
+        with open(result_resume["file_path"], "r", encoding="utf-8") as f:
+            data2 = json.load(f)
+        self.assertEqual(data2["export_info"]["exported_by"], "resume_user")
+        self.assertEqual(data2["export_info"]["batch_id"], 3)
+
+        del db2
+
+
 @unittest.skipUnless(HAS_CLICK, "Click is required for CLI tests")
 class TestBatchChangesCLIEntrypoints(unittest.TestCase):
     """batch changes 命令的 CLI 入口回归测试，覆盖不带参数和带 batch_id 两种情况"""

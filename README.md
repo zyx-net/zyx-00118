@@ -344,6 +344,9 @@ python -m invoice_reconciler.cli.main import payments \
 python -m invoice_reconciler.cli.main match --operator zhangsan
 
 # ========= 步骤 1：重新导入更新版发票文件（自动触发变更追踪） =========
+# 使用 sample_invoices_updated.csv（更新版），与 v1 相比有 4 类变化：
+#   INV002 状态 normal→void、INV004 金额 12500→13000、
+#   INV005 客户名变更、INV016 新增记录
 # 重新导入时会自动检测 4 类变更，并评估对匹配结果的影响
 #   - new_record: 新增记录（原批次没有）
 #   - status_change: 状态变更（如"正常"变"作废"）
@@ -354,7 +357,7 @@ python -m invoice_reconciler.cli.main match --operator zhangsan
 #          affects_pending(影响待确认) / affects_revoked(影响已撤销) /
 #          warning(警告) / none(无影响)
 python -m invoice_reconciler.cli.main import invoices \
-    invoice_reconciler/data/sample_invoices.csv --operator lisi
+    invoice_reconciler/data/sample_invoices_updated.csv --operator lisi
 
 # ========= 步骤 2：默认查看所有批次的变更（不带 batch_id） =========
 # 适合先全局看一遍所有变更，再决定深入哪个批次
@@ -376,10 +379,10 @@ python -m invoice_reconciler.cli.main batch changes --impact-type critical
 python -m invoice_reconciler.cli.main batch changes --impact-type affects_confirmed
 
 # ========= 步骤 5：缩小到具体批次查看 =========
-# 先看批次列表找批次ID
+# 先看批次列表找批次ID（按导入顺序，发票v1=1、收款v1=2、发票v2=3）
 python -m invoice_reconciler.cli.main batch list
-# 查看指定批次的所有变更
-python -m invoice_reconciler.cli.main batch changes --batch-id 2
+# 查看指定批次的所有变更（请将 3 替换为 batch list 中你要查看的批次ID）
+python -m invoice_reconciler.cli.main batch changes --batch-id 3
 
 # ========= 步骤 6：按记录编号精准查找 =========
 python -m invoice_reconciler.cli.main batch changes --record-no INV005
@@ -404,12 +407,13 @@ python -m invoice_reconciler.cli.main batch changes --status reviewed
 #   - 操作者、检测时间
 #   - 关联批次、处理状态
 #   - 影响分析详情
-python -m invoice_reconciler.cli.main batch export-changes 2 \
+# （请将 3 替换为 batch list 中你要导出的批次ID）
+python -m invoice_reconciler.cli.main batch export-changes 3 \
     --operator lisi --format json
 
 # ========= 步骤 9：导出变更日志（CSV 格式，适合 Excel 打开） =========
 # 会生成两个文件：变更摘要.csv + 变更明细.csv
-python -m invoice_reconciler.cli.main batch export-changes 2 \
+python -m invoice_reconciler.cli.main batch export-changes 3 \
     --operator lisi --format csv
 
 # ========= 步骤 10：模拟程序重启 - 恢复导出上下文 =========
