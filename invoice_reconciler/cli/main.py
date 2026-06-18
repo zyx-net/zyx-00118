@@ -175,19 +175,6 @@ def cli(ctx, config_path):
                         fg="yellow"
                     ))
 
-        last_export = workbench.get_last_export_context()
-        if last_export:
-            click.echo(click.style(
-                f"[会话恢复] 上次导出: 批次 #{last_export['batch_id']} - "
-                f"{last_export.get('file_name', '-')} ({last_export['export_type']}, {last_export['format']})",
-                fg="yellow"
-            ))
-            if last_export.get("exported_at"):
-                click.echo(click.style(
-                    f"[会话恢复] 导出时间: {last_export['exported_at']}",
-                    fg="yellow"
-                ))
-
         last_view = workbench.get_last_change_view_context()
         if last_view:
             parts = []
@@ -2270,10 +2257,27 @@ def batch_export_changes(ctx, batch_id, operator, export_format,
         click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
         sys.exit(1)
 
+    receipt_cabinet = ctx.obj["receipt_cabinet"]
+    actual_log_ids = log_ids if log_ids else [l["id"] for l in logs]
+    receipt_result = receipt_cabinet.create_receipt_from_export(
+        operator=operator,
+        batch_id=batch_id,
+        target_file=result["file_path"],
+        export_format=export_format,
+        filter_snapshot=filter_info,
+        log_ids=actual_log_ids,
+        summary_stats=result["summary"],
+    )
+
     click.echo(click.style(f"[OK] 变更日志已导出: {result['file_path']}", fg="green"))
     click.echo(f"格式: {result['format']}")
     click.echo(f"命中数: {result['total_changes']} 条")
     click.echo(f"生成时间: {result['generated_at']}")
+    if receipt_result.get("success"):
+        click.echo(click.style(f"[OK] 导出回执已生成: {receipt_result['receipt_id']}", fg="green"))
+        click.echo(f"  查看回执: receipt show {receipt_result['receipt_id']}")
+        click.echo(f"  对比回执: receipt compare {receipt_result['receipt_id']}")
+        click.echo(f"  续导回执: receipt resume {receipt_result['receipt_id']}")
     click.echo()
     click.echo("导出摘要（与筛选视图一致）:")
     click.echo("  按变更类型:")
@@ -2311,12 +2315,72 @@ def batch_change_status(ctx, log_id, processing_status, operator, remark):
 
 @batch.command("resume-export")
 @click.option("--operator", default=None, help="当前操作者")
+@click.option("--force", is_flag=True, default=False, help="强制续导（忽略非严重拦截项）")
 @click.pass_context
-def batch_resume_export(ctx, operator):
+def batch_resume_export(ctx, operator, force):
     """使用上次导出上下文继续导出（程序重启后不丢失）"""
     workbench = ctx.obj["workbench"]
     tracker = ctx.obj["change_tracker"]
+    receipt_cabinet = ctx.obj["receipt_cabinet"]
+    exporter = ctx.obj["exporter"]
     operator = operator or get_current_user()
+
+    latest_receipt = receipt_cabinet.find_latest_receipt()
+    if latest_receipt:
+        receipt_id = latest_receipt.get("receipt_id")
+        batch_id = latest_receipt.get("batch_id")
+        export_format = latest_receipt.get("export_format", "json")
+        hit_count = latest_receipt.get("hit_count", 0)
+
+        click.echo(click.style(f"[会话恢复] 使用上次导出回执: {receipt_id}", fg="cyan"))
+        click.echo(f"  批次: #{batch_id} - {latest_receipt.get('file_name', '-') or latest_receipt.get('target_file', '-')}")
+        click.echo(f"  格式: {export_format}")
+        click.echo(f"  命中记录: {hit_count} 条")
+        if latest_receipt.get("exported_at"):
+            click.echo(f"  上次导出时间: {latest_receipt['exported_at']}")
+        click.echo()
+
+        check = receipt_cabinet.check_interceptions(receipt_id)
+        if check.get("interceptions") and not force:
+            click.echo(click.style(
+                f"[!!] 检测到 {check['interception_count']} 个拦截项:",
+                fg="red", bold=True
+            ))
+            for i in check["interceptions"]:
+                click.echo(click.style(
+                    f"  • [{i['severity']}] {i['label']}: {i['detail']}",
+                    fg="red" if i["severity"] == "critical" else "yellow"
+                ))
+            if check.get("can_resume"):
+                click.echo(click.style("使用 --force 强制续导（仅非严重拦截项）", fg="yellow"))
+            else:
+                click.echo(click.style("存在严重拦截项，请先处理: receipt handle", fg="red"))
+            sys.exit(1)
+
+        resume_result = receipt_cabinet.resume_with_receipt(
+            receipt_id, operator, force=force
+        )
+
+        if not resume_result["success"]:
+            click.echo(click.style(f"[!!] 续导失败", fg="red"), err=True)
+            if resume_result.get("message"):
+                click.echo(resume_result["message"])
+            sys.exit(1)
+
+        export_result = resume_result.get("export_result")
+        if export_result and export_result.get("success"):
+            click.echo(click.style(f"[OK] 导出已完成: {export_result['file_path']}", fg="green"))
+            click.echo(f"格式: {export_result['format']}")
+            click.echo(f"生成时间: {export_result['generated_at']}")
+            if export_result.get("total_changes") is not None:
+                click.echo(f"记录数: {export_result['total_changes']}")
+        else:
+            click.echo(click.style("[!!] 导出未成功", fg="red"), err=True)
+            if export_result and export_result.get("message"):
+                click.echo(export_result["message"])
+            sys.exit(1)
+
+        return
 
     last_context = workbench.get_last_export_context()
     if not last_context:
@@ -2353,7 +2417,6 @@ def batch_resume_export(ctx, operator):
             log_ids=log_ids, extra_meta=extra_meta
         )
     elif export_type == "batch_progress":
-        exporter = ctx.obj["exporter"]
         click.echo(f"正在导出批次 #{batch_id} 进度...")
         result = exporter.export_batch_progress(batch_id, operator, format=export_format)
     else:

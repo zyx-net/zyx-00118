@@ -104,18 +104,36 @@ class ExportReceiptCabinet:
         return f"{prefix}{seq:03d}"
 
     def _compute_record_fingerprints(self, log_ids: List[int] = None,
-                                     batch_id: int = None) -> List[str]:
+                                     batch_id: int = None,
+                                     filters: Dict = None) -> List[str]:
         from .change_tracker import ChangeTracker
         tracker = ChangeTracker(self.config, self.db)
-        if batch_id:
+
+        if log_ids is not None and len(log_ids) > 0:
+            all_logs = self.db.get_batch_change_logs(batch_id=batch_id) if batch_id else self.db.get_batch_change_logs()
+            id_set = set(log_ids)
+            logs = [l for l in all_logs if l["id"] in id_set]
+            logs.sort(key=lambda x: log_ids.index(x["id"]) if x["id"] in log_ids else 9999)
+        elif filters is not None and batch_id is not None:
+            filtered = tracker.get_filtered_changes(
+                batch_id=batch_id,
+                change_type=filters.get("change_type"),
+                impact_type=filters.get("impact_type"),
+                processing_status=filters.get("processing_status"),
+                record_no=filters.get("record_no"),
+                affect_filter=filters.get("affect_filter"),
+                with_conflicts_only=filters.get("with_conflicts_only", False),
+                operator="_receipt",
+            )
+            logs = filtered.get("logs", [])
+        elif batch_id is not None:
             view = self._workbench.get_unified_change_view(
                 batch_id=batch_id, operator="_receipt"
             )
             logs = view.get("logs", [])
         else:
             logs = []
-        if log_ids:
-            logs = [l for l in logs if l.get("id") in log_ids] if logs else []
+
         fingerprints = []
         for log in logs:
             raw = f"{log.get('record_type','')}|{log.get('record_no','')}|{log.get('change_type','')}|{log.get('batch_id','')}"
@@ -160,7 +178,7 @@ class ExportReceiptCabinet:
         receipt_id = self._generate_receipt_id()
 
         fingerprints = self._compute_record_fingerprints(
-            log_ids=log_ids, batch_id=batch_id
+            log_ids=log_ids, batch_id=batch_id, filters=filter_snapshot
         )
 
         current_filters = self._workbench.get_filters()
@@ -199,6 +217,7 @@ class ExportReceiptCabinet:
             "batch_id": batch_id,
             "hit_count": len(fingerprints),
             "exported_at": datetime.now().isoformat(),
+            "log_ids": log_ids or [],
         }
 
         self.db.save_export_receipt(receipt_id, config_hash, receipt_data)
@@ -226,6 +245,22 @@ class ExportReceiptCabinet:
             "hit_count": len(fingerprints),
             "exported_at": receipt_data["exported_at"],
         }
+
+    def create_receipt_from_export(self, operator: str, batch_id: int,
+                                   target_file: str, export_format: str,
+                                   filter_snapshot: Dict,
+                                   log_ids: List[int],
+                                   summary_stats: Dict = None) -> Dict:
+        return self.create_receipt(
+            operator=operator,
+            target_file=target_file,
+            export_format=export_format,
+            batch_id=batch_id,
+            filter_snapshot=filter_snapshot,
+            summary_stats=summary_stats,
+            log_ids=log_ids,
+            subsequent_actions=["show", "compare", "resume", "abandon"],
+        )
 
     def read_receipt(self, receipt_id: str, operator: str = None) -> Dict:
         receipt = self.db.get_export_receipt(receipt_id)
@@ -612,48 +647,53 @@ class ExportReceiptCabinet:
         comparisons = []
 
         batch_id = receipt.get("batch_id")
+        filter_snapshot = receipt.get("filter_snapshot") or {}
+        log_ids = receipt.get("log_ids") or []
+
         if batch_id:
-            current_view = self._workbench.get_unified_change_view(
-                batch_id=batch_id, operator=operator or "_compare"
-            )
-            current_logs = current_view.get("logs", [])
-            current_fingerprints = self._compute_record_fingerprints(
-                batch_id=batch_id
-            )
+            if filter_snapshot and isinstance(filter_snapshot, dict) and len(filter_snapshot) > 0:
+                current_fingerprints = self._compute_record_fingerprints(
+                    batch_id=batch_id,
+                    filters=filter_snapshot
+                )
+            elif log_ids:
+                current_fingerprints = self._compute_record_fingerprints(
+                    log_ids=log_ids, batch_id=batch_id
+                )
+            else:
+                current_fingerprints = self._compute_record_fingerprints(
+                    batch_id=batch_id
+                )
         else:
             current_fingerprints = []
-            current_logs = []
 
         receipt_fps = set(receipt.get("record_fingerprints", []))
         current_fps = set(current_fingerprints)
 
-        if receipt_fps != current_fps:
-            added = current_fps - receipt_fps
-            removed = receipt_fps - current_fps
-            comparisons.append({
-                "field": "record_fingerprints",
-                "label": "记录指纹",
-                "receipt_count": len(receipt_fps),
-                "current_count": len(current_fps),
-                "added_count": len(added),
-                "removed_count": len(removed),
-                "match": False,
-                "detail": (
-                    f"回执 {len(receipt_fps)} 条, 当前 {len(current_fps)} 条, "
-                    f"新增 {len(added)}, 缺失 {len(removed)}"
-                ),
-            })
+        added = current_fps - receipt_fps
+        removed = receipt_fps - current_fps
+        comparisons.append({
+            "field": "record_fingerprints",
+            "label": "记录指纹",
+            "receipt_count": len(receipt_fps),
+            "current_count": len(current_fps),
+            "added_count": len(added),
+            "removed_count": len(removed),
+            "match": receipt_fps == current_fps,
+            "detail": (
+                f"回执 {len(receipt_fps)} 条, 当前 {len(current_fps)} 条, "
+                f"新增 {len(added)}, 缺失 {len(removed)}"
+            ),
+        })
 
-        current_filters = self._workbench.get_filters() or {}
         receipt_filters = receipt.get("filter_snapshot") or {}
-        if current_filters != receipt_filters:
-            comparisons.append({
-                "field": "filter_snapshot",
-                "label": "筛选条件",
-                "receipt": receipt_filters,
-                "current": current_filters,
-                "match": False,
-            })
+        comparisons.append({
+            "field": "filter_snapshot",
+            "label": "筛选快照",
+            "receipt": receipt_filters,
+            "match": True,
+            "detail": "使用回执中的筛选条件作为对比范围",
+        })
 
         target_file = receipt.get("target_file", "")
         current_file_hash = self._compute_file_hash(target_file)
@@ -745,7 +785,7 @@ class ExportReceiptCabinet:
                 event_details={
                     "interceptions": [
                         {"type": i["type"], "severity": i["severity"]}
-                        for i in check["interceptions"]
+                    for i in check["interceptions"]
                     ],
                 },
                 event_label=RECEIPT_EVENT_LABELS[RECEIPT_EVENT_BLOCK]
@@ -785,16 +825,51 @@ class ExportReceiptCabinet:
 
         batch_id = receipt.get("batch_id")
         export_format = receipt.get("export_format", "json")
-        target_file = receipt.get("target_file", "")
+        filter_snapshot = receipt.get("filter_snapshot") or {}
+        log_ids = receipt.get("log_ids") or []
 
         export_result = None
         if batch_id:
             from .change_tracker import ChangeTracker
             tracker = ChangeTracker(self.config, self.db)
             try:
-                export_result = tracker.export_change_logs(
-                    batch_id, operator, format=export_format
-                )
+                extra_meta = {
+                    "filter_note": "续导：使用回执中的筛选条件",
+                    "resumed_from_receipt": receipt_id,
+                    "applied_filters": filter_snapshot,
+                    "hit_count": len(log_ids) if log_ids else 0,
+                }
+
+                if log_ids:
+                    export_result = tracker.export_change_logs(
+                        batch_id, operator, format=export_format,
+                        log_ids=log_ids,
+                        extra_meta=extra_meta,
+                    )
+                elif filter_snapshot and isinstance(filter_snapshot, dict):
+                    from .change_tracker import ChangeTracker
+                    filtered = tracker.get_filtered_changes(
+                        batch_id=batch_id,
+                        change_type=filter_snapshot.get("change_type"),
+                        impact_type=filter_snapshot.get("impact_type"),
+                        processing_status=filter_snapshot.get("processing_status"),
+                        record_no=filter_snapshot.get("record_no"),
+                        affect_filter=filter_snapshot.get("affect_filter"),
+                        with_conflicts_only=filter_snapshot.get("with_conflicts_only", False),
+                        operator=operator,
+                    )
+                    current_log_ids = [l["id"] for l in filtered["logs"]]
+                    extra_meta["hit_count"] = len(current_log_ids)
+                    export_result = tracker.export_change_logs(
+                        batch_id, operator, format=export_format,
+                        log_ids=current_log_ids if current_log_ids else None,
+                        extra_meta=extra_meta,
+                    )
+                else:
+                    export_result = tracker.export_change_logs(
+                        batch_id, operator, format=export_format
+                    )
+
                 self.db.log_receipt_timeline_event(
                     receipt_id, RECEIPT_EVENT_RESUME, operator,
                     status="success" if export_result.get("success") else "partial",
@@ -805,6 +880,27 @@ class ExportReceiptCabinet:
                     },
                     event_label="导出执行"
                 )
+
+                if export_result.get("success"):
+                    new_file_path = export_result.get("file_path")
+                    new_file_hash = self._compute_file_hash(new_file_path)
+                    if new_file_path:
+                        self.db.update_export_receipt_field(
+                            receipt_id, "target_file", new_file_path
+                        )
+                    if new_file_hash:
+                        self.db.update_export_receipt_field(
+                            receipt_id, "file_hash", new_file_hash
+                        )
+                    new_fingerprints = self._compute_record_fingerprints(
+                        log_ids=log_ids if log_ids else None,
+                        batch_id=batch_id,
+                        filters=filter_snapshot if filter_snapshot and not log_ids else None
+                    )
+                    if new_fingerprints:
+                        self.db.update_export_receipt_field(
+                            receipt_id, "record_fingerprints", new_fingerprints
+                        )
             except Exception as e:
                 export_result = {"success": False, "message": str(e)}
                 self.db.log_receipt_timeline_event(

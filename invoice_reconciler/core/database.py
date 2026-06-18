@@ -456,6 +456,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_receipt_timeline_created ON export_receipt_timeline(created_at);
             """)
 
+            self._run_migrations()
+
+    def _run_migrations(self):
+        with self._get_conn() as conn:
+            try:
+                cols = [row[1] for row in conn.execute(
+                    "PRAGMA table_info(export_receipts)"
+                ).fetchall()]
+                if "log_ids" not in cols:
+                    conn.execute("ALTER TABLE export_receipts ADD COLUMN log_ids TEXT")
+            except Exception:
+                pass
+
     @staticmethod
     def calculate_file_hash(file_path: str) -> str:
         hasher = hashlib.sha256()
@@ -2283,6 +2296,9 @@ class Database:
         subsequent_actions = json.dumps(
             receipt_data.get("subsequent_actions", []), ensure_ascii=False
         ) if receipt_data.get("subsequent_actions") is not None else None
+        log_ids = json.dumps(
+            receipt_data.get("log_ids", []), ensure_ascii=False
+        ) if receipt_data.get("log_ids") is not None else None
         with self._get_conn() as conn:
             conn.execute(
                 """INSERT INTO export_receipts
@@ -2290,8 +2306,8 @@ class Database:
                     export_format, record_fingerprints, filter_snapshot,
                     summary_stats, file_hash, export_dir, working_dir,
                     subsequent_actions, session_id, batch_id, hit_count,
-                    exported_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    exported_at, log_ids, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                    ON CONFLICT(receipt_id) DO UPDATE SET
                    config_hash = excluded.config_hash,
                    status = excluded.status,
@@ -2309,6 +2325,7 @@ class Database:
                    batch_id = excluded.batch_id,
                    hit_count = excluded.hit_count,
                    exported_at = excluded.exported_at,
+                   log_ids = excluded.log_ids,
                    updated_at = CURRENT_TIMESTAMP""",
                 (receipt_id, config_hash,
                  receipt_data.get("status", "active"),
@@ -2323,7 +2340,8 @@ class Database:
                  receipt_data.get("session_id"),
                  receipt_data.get("batch_id"),
                  receipt_data.get("hit_count", 0),
-                 receipt_data.get("exported_at"))
+                 receipt_data.get("exported_at"),
+                 log_ids)
             )
 
     def get_export_receipt(self, receipt_id: str) -> Optional[Dict]:
@@ -2336,7 +2354,7 @@ class Database:
                 return None
             result = dict(row)
             for field in ("record_fingerprints", "filter_snapshot",
-                          "summary_stats", "subsequent_actions"):
+                          "summary_stats", "subsequent_actions", "log_ids"):
                 if result.get(field) and isinstance(result[field], str):
                     try:
                         result[field] = json.loads(result[field])
@@ -2359,7 +2377,7 @@ class Database:
             for row in rows:
                 row_dict = dict(row)
                 for field in ("record_fingerprints", "filter_snapshot",
-                              "summary_stats", "subsequent_actions"):
+                              "summary_stats", "subsequent_actions", "log_ids"):
                     if row_dict.get(field) and isinstance(row_dict[field], str):
                         try:
                             row_dict[field] = json.loads(row_dict[field])

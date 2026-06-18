@@ -32,6 +32,7 @@
 - **影响分析**：自动识别变更对已确认/待确认/已撤销数据的影响程度（严重/影响已确认/影响待确认/影响已撤销/警告/无影响）
 - **变更日志导出**：JSON 和 CSV 双格式稳定输出变更前后摘要、操作者、时间、关联批次、处理状态，支持交接追溯
 - **导出上下文持久化**：程序重启后恢复上次导出上下文，`resume-export` 可一键继续导出不丢上下文
+- **导出回执与单一事实来源**：每次 `batch export-changes` 自动生成回执，记录真实筛选快照、记录指纹、目标文件和摘要；`receipt show/compare/resume` 只认这份真实导出上下文，杜绝全量视角回退；跨重启、同配置接手、文件被改、目录无权限、工作目录迁移等场景要么安全续导，要么明确拦截
 
 ## 安装
 
@@ -473,6 +474,157 @@ python -m invoice_reconciler.cli.main batch changes
   }
   ```
 
+### 15c. 导出回执与单一事实来源
+
+> **核心设计理念**：回执不是平行命令，而是 `batch export-changes` 主流程的一部分。
+> 每次导出自动落下真实的筛选快照、记录指纹、目标文件和摘要，后续 `receipt show/compare/resume`
+> 只认这份真实导出上下文，**不会回退成整批全量视角**。
+> 回执是导出状态的**单一事实来源**，替代了之前导出状态、回执状态、恢复提示各存一份的分叉逻辑。
+
+#### 回执包含什么（单一事实来源）
+
+每次 `batch export-changes` 成功后自动创建回执，包含以下完整上下文：
+
+| 字段 | 说明 |
+|------|------|
+| receipt_no | 回执编号，如 E202606180001，全局唯一 |
+| batch_id | 导出的批次ID |
+| operator | 导出操作者 |
+| export_format | 导出格式（json/csv/xlsx） |
+| target_file | 实际导出的目标文件绝对路径 |
+| file_hash | 导出文件的 SHA256 哈希，用于检测文件篡改 |
+| filter_snapshot | 导出时实际命中的筛选条件快照（change_type/impact_type/status/record_no 等） |
+| log_ids | 本次导出实际命中的变更日志ID列表（精确到每一条） |
+| record_fingerprints | 基于 log_ids 计算的记录指纹列表（每条记录 = 类型+编号+变更类型+批次ID 的哈希） |
+| summary_stats | 导出摘要：total_records、exported_records、by_change_type 等统计 |
+| created_at | 导出时间戳 |
+
+#### 命令速查
+
+```bash
+# ── 1. 导出（自动创建回执） ──
+# 筛选导出 status_change 类型的变更（只导出1条也可以）
+python -m invoice_reconciler.cli.main batch export-changes 3 \
+    --operator lisi --format json --change-type status_change
+
+# 导出成功后会输出：
+#   ✅ 变更日志已导出: <文件路径>
+#   🧾 已创建导出回执: E202606180001 (命中 1 条记录)
+#   后续可用: receipt show / receipt compare / receipt resume
+
+# ── 2. 查看回执（显示真实导出上下文，不是全量视角） ──
+python -m invoice_reconciler.cli.main receipt show E202606180001
+# 输出包含：回执编号、批次、筛选快照、命中 log_ids、目标文件、摘要统计
+
+# ── 3. 对比回执（检测导出后是否有变化） ──
+python -m invoice_reconciler.cli.main receipt compare E202606180001
+# 对比项：
+#   - 目标文件是否被修改（file_hash 校验）
+#   - 记录指纹是否一致（基于 log_ids 重新计算，只对比真实导出范围）
+#   - 筛选快照是否匹配
+# 所有项匹配输出 ✅，有差异输出 ❌ 并标注具体差异
+
+# ── 4. 续导回执（用完全相同的筛选条件 + log_ids 重新导出） ──
+python -m invoice_reconciler.cli.main receipt resume E202606180001 --operator lisi
+# 续导前自动执行拦截检测：
+#   - 文件是否被修改（可通过 --force 跳过）
+#   - 导出目录是否可写
+#   - 工作目录是否迁移（找不到文件时拦截）
+# 续导成功后自动更新回执中的 target_file、file_hash、record_fingerprints
+
+# ── 5. 列出所有回执 ──
+python -m invoice_reconciler.cli.main receipt list
+# 显示回执编号、批次、操作者、导出时间、命中记录数
+
+# ── 6. batch resume-export（优先使用最新回执） ──
+python -m invoice_reconciler.cli.main batch resume-export --operator lisi
+# 自动查找最新回执作为导出上下文，带拦截检测
+# 也支持 --force 强制跳过拦截
+```
+
+#### 拦截检测场景说明
+
+系统在 `receipt resume` 和 `batch resume-export` 时会执行以下检测，
+**要么安全续导，要么明确拦截**：
+
+| 场景 | 行为 | 处理方式 |
+|------|------|----------|
+| 跨程序重启 | ✅ 安全续导 | 回执存在数据库中，重启后直接使用 |
+| 同配置重新接手 | ✅ 安全续导 | 同一配置下回执上下文一致 |
+| 导出文件被修改 | ❌ 拦截 | 检测到 file_hash 不匹配，提示文件已被修改 |
+| 导出目录无写入权限 | ❌ 拦截 | 检查目录可写性，提示权限不足 |
+| 工作目录迁移（原文件找不到） | ❌ 拦截 | 目标文件路径不存在，提示工作目录可能已迁移 |
+| 数据库中对应 log_ids 的记录已被删除 | ❌ 拦截 | 提示导出范围的记录已不存在 |
+| 想用旧的筛选条件但数据已变 | ⚠️ 按真实 log_ids 导出 | 不会回退到全量，始终只导回执中记录的范围 |
+
+> **强制续导**：如果确认文件修改不影响、或想换个目录重新导出，
+> 可加 `--force` 参数跳过文件哈希校验，但 log_ids 和筛选快照仍会被严格遵守。
+
+#### 完整验证链路（可实际复制运行）
+
+```bash
+# ═══════════════════════════════════════════════════════════
+#  完整链路：导出1条 → 关掉再开 → 查看 → 对比 → 续导 → 异常拦截
+# ═══════════════════════════════════════════════════════════
+
+# ── 0. 环境准备（如果没有数据，先跑一遍导入+匹配+重导） ──
+Remove-Item -Recurse -Force invoice_reconciler\data\reconciler.db -ErrorAction SilentlyContinue
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator zhangsan
+python -m invoice_reconciler.cli.main import payments \
+    invoice_reconciler/data/sample_payments.csv --operator zhangsan
+python -m invoice_reconciler.cli.main match --operator zhangsan
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices_updated.csv --operator lisi
+# 记下最后一次导入的批次ID（通常是 3），下文用 <BATCH_ID>
+
+# ── 1. 筛选导出：只导 status_change 类型（应只命中1-2条） ──
+python -m invoice_reconciler.cli.main batch export-changes <BATCH_ID> \
+    --operator lisi --format json --change-type status_change
+# ✅ 输出包含回执编号，如 E202606180001，记下它下文用 <RECEIPT_NO>
+
+# ── 2. 模拟程序关掉再开（实际关不关都一样，DB 持久化） ──
+# 直接执行下一步即可验证跨重启
+
+# ── 3. 查看回执（确认只记住了真实导出的筛选范围） ──
+python -m invoice_reconciler.cli.main receipt show <RECEIPT_NO>
+# 验证点：filter_snapshot 中有 change-type=status_change，
+#         log_ids 数量很少（1-2条），不是整批全量
+
+# ── 4. 对比回执（导出后还没动过，应该全部匹配） ──
+python -m invoice_reconciler.cli.main receipt compare <RECEIPT_NO>
+# 预期：所有对比项显示 ✅ MATCH
+
+# ── 5. 续导回执（用相同筛选条件重新导出） ──
+python -m invoice_reconciler.cli.main receipt resume <RECEIPT_NO> --operator lisi
+# 预期：拦截检测通过，重新导出成功，回执自动更新 file_hash
+
+# ── 6. 异常拦截：修改导出文件后尝试续导 ──
+# 先找到回执中 target_file 指向的 JSON 文件，随便改一个字符
+# 然后尝试续导：
+python -m invoice_reconciler.cli.main receipt resume <RECEIPT_NO> --operator lisi
+# 预期：❌ 拦截，提示 "导出文件已被修改"
+
+# ── 7. 强制续导（跳过文件哈希校验） ──
+python -m invoice_reconciler.cli.main receipt resume <RECEIPT_NO> --operator lisi --force
+# 预期：跳过文件哈希检查，续导成功（但 log_ids 和筛选条件仍严格遵守）
+
+# ── 8. batch resume-export 也走回执逻辑 ──
+python -m invoice_reconciler.cli.main batch resume-export --operator lisi
+# 预期：自动找到最新回执，使用其上下文导出，而不是旧的 session state
+```
+
+#### 与旧版分叉逻辑的对比
+
+| 维度 | 旧版（分叉逻辑） | 新版（单一事实来源） |
+|------|------------------|----------------------|
+| 导出状态存储 | workbench session state + 回执 + 恢复提示，各存一份 | 只存在回执（export_receipts 表） |
+| 续导上下文 | 可能回退到整批全量（3条） | 始终使用回执中的 log_ids + filter_snapshot，精确到条 |
+| 对比范围 | 用 workbench 当前筛选条件，可能和导出时不一致 | 只用回执中记录的筛选快照，保证对比的是同一范围 |
+| 文件篡改检测 | 无 | SHA256 哈希校验，修改即拦截 |
+| 跨重启可靠性 | 依赖 session state，可能丢失 | 回执持久化在 DB，100% 可恢复 |
+| 命令入口 | receipt 是平行命令，和 export-changes 脱节 | export-changes 自动生成回执，receipt 是回执的操作入口 |
+
 ## 配置说明
 
 配置文件默认路径：`invoice_reconciler/data/config.yaml`
@@ -649,8 +801,16 @@ A: 使用 `batch changes` 命令：不带参数默认查看所有批次的全部
 用 `--impact-type` 按影响程度过滤。具体示例见"批次工作台 → 变更追踪"章节。
 
 ### Q: 程序重启后导出会丢上下文吗？
-A: 不会。上次导出的批次、类型、格式都会持久化保存，用 `batch resume-export`
-可以一键继续导出，不用重新记参数。上次查看变更的范围和过滤条件也会恢复。
+A: 不会。每次 `batch export-changes` 成功后会自动创建导出回执，记录完整的导出上下文（筛选快照、log_ids、目标文件、记录指纹、摘要统计）。回执持久化在 SQLite 中，用 `batch resume-export` 或 `receipt resume <回执编号>` 可以一键继续导出，保证续导范围和导出时完全一致，不会回退到整批全量。
+
+### Q: 导出回执和 batch resume-export 有什么关系？
+A: 回执是导出状态的**单一事实来源**。`batch export-changes` 自动生成回执，`batch resume-export` 优先使用最新回执的上下文，`receipt show/compare/resume` 直接操作回执。旧的 workbench session state 逻辑保留作回退兼容，但优先走回执。
+
+### Q: 回执对比时说"记录指纹不匹配"是什么意思？
+A: 说明回执记录的导出范围内，某些变更记录的内容已经变了（比如状态又更新了、金额又改了）。这意味着数据库中的数据和导出时已经不一致，需要决定是否重新导出。对比是**只针对回执中 log_ids 记录的真实导出范围**，不会拿整批全量来比。
+
+### Q: 修改了导出文件后续导被拦截了怎么办？
+A: 如果只是文件被改了但数据库数据没变，加 `--force` 参数可以跳过文件哈希校验强制续导。但 `--force` 不会跳过 log_ids 和筛选快照的约束，续导仍会严格按回执记录的范围导出，不会回退到全量。如果想重新筛选导出，请直接用 `batch export-changes` 重新导出，会自动生成新的回执。
 
 ### Q: 程序重启后快照和历史会丢失吗？
 A: 不会。所有快照、状态历史和匹配数据都保存在 SQLite 数据库中，程序重启后可以继续操作。

@@ -919,5 +919,388 @@ class TestRealCLIHandoverChain(_BaseReceiptTest):
         self.assertIn("导出回执", result.output)
 
 
+class TestReceiptFromExport(_BaseReceiptTest):
+    def test_create_receipt_from_export_basic(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        filtered = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            change_type="status_change",
+            operator="test_user",
+        )
+        log_ids = [l["id"] for l in filtered["logs"]]
+        self.assertEqual(len(log_ids), 1)
+
+        target = self._create_target_file(name="filtered_export.json")
+
+        filter_snapshot = {
+            "batch_id": second_batch_id,
+            "change_type": "status_change",
+            "impact_type": None,
+            "processing_status": None,
+        }
+
+        result = self.cabinet.create_receipt_from_export(
+            operator="test_exporter",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot=filter_snapshot,
+            log_ids=log_ids,
+            summary_stats=filtered["summary"],
+        )
+
+        self.assertTrue(result["success"])
+        self.assertTrue(result["receipt_id"].startswith("ER"))
+
+        receipt = self.db.get_export_receipt(result["receipt_id"])
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["hit_count"], 1)
+        self.assertEqual(len(receipt.get("log_ids", [])), 1)
+        self.assertEqual(receipt["log_ids"], log_ids)
+        self.assertEqual(receipt["filter_snapshot"]["change_type"], "status_change")
+        self.assertEqual(len(receipt.get("record_fingerprints", [])), 1)
+
+    def test_create_receipt_from_export_with_full_batch(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        all_changes = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            operator="test_user",
+        )
+        all_log_ids = [l["id"] for l in all_changes["logs"]]
+        self.assertGreater(len(all_log_ids), 1)
+
+        target = self._create_target_file(name="full_export.json")
+
+        result = self.cabinet.create_receipt_from_export(
+            operator="test_exporter",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot={"batch_id": second_batch_id},
+            log_ids=all_log_ids,
+            summary_stats=all_changes["summary"],
+        )
+
+        self.assertTrue(result["success"])
+        receipt = self.db.get_export_receipt(result["receipt_id"])
+        self.assertEqual(receipt["hit_count"], len(all_log_ids))
+        self.assertEqual(len(receipt["record_fingerprints"]), len(all_log_ids))
+
+
+class TestReceiptFilteredCompare(_BaseReceiptTest):
+    def test_compare_uses_filter_snapshot(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        filtered = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            change_type="status_change",
+            operator="test_user",
+        )
+        log_ids = [l["id"] for l in filtered["logs"]]
+
+        target = self._create_target_file(name="compare_test.json")
+        filter_snapshot = {
+            "batch_id": second_batch_id,
+            "change_type": "status_change",
+        }
+
+        create_result = self.cabinet.create_receipt_from_export(
+            operator="test_user",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot=filter_snapshot,
+            log_ids=log_ids,
+            summary_stats=filtered["summary"],
+        )
+        receipt_id = create_result["receipt_id"]
+
+        compare_result = self.cabinet.compare_receipt(receipt_id, "test_user")
+        self.assertTrue(compare_result["success"])
+
+        record_comparison = None
+        for c in compare_result["comparisons"]:
+            if c["field"] == "record_fingerprints":
+                record_comparison = c
+                break
+
+        self.assertIsNotNone(record_comparison)
+        self.assertTrue(record_comparison["match"])
+        self.assertEqual(record_comparison["receipt_count"], 1)
+        self.assertEqual(record_comparison["current_count"], 1)
+
+    def test_compare_detects_record_fingerprint_mismatch(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        filtered = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            operator="test_user",
+        )
+        log_ids = [l["id"] for l in filtered["logs"]]
+        initial_count = len(log_ids)
+        self.assertGreater(initial_count, 1)
+
+        target = self._create_target_file(name="full_export.json")
+        filter_snapshot = {
+            "batch_id": second_batch_id,
+        }
+
+        create_result = self.cabinet.create_receipt_from_export(
+            operator="test_user",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot=filter_snapshot,
+            log_ids=log_ids,
+            summary_stats=filtered["summary"],
+        )
+        receipt_id = create_result["receipt_id"]
+
+        self.db.update_export_receipt_field(
+            receipt_id, "record_fingerprints",
+            ["fake_fingerprint_1", "fake_fingerprint_2"]
+        )
+
+        compare_result = self.cabinet.compare_receipt(receipt_id, "test_user")
+        self.assertTrue(compare_result["success"])
+
+        record_comparison = None
+        for c in compare_result["comparisons"]:
+            if c["field"] == "record_fingerprints":
+                record_comparison = c
+                break
+
+        self.assertIsNotNone(record_comparison)
+        self.assertFalse(record_comparison["match"])
+        self.assertEqual(record_comparison["receipt_count"], 2)
+        self.assertEqual(record_comparison["current_count"], initial_count)
+
+
+class TestReceiptFilteredResume(_BaseReceiptTest):
+    def test_resume_uses_filter_snapshot(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        filtered = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            change_type="status_change",
+            operator="test_user",
+        )
+        log_ids = [l["id"] for l in filtered["logs"]]
+
+        target = self._create_target_file(name="resume_test.json")
+        filter_snapshot = {
+            "batch_id": second_batch_id,
+            "change_type": "status_change",
+        }
+
+        create_result = self.cabinet.create_receipt_from_export(
+            operator="test_user",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot=filter_snapshot,
+            log_ids=log_ids,
+            summary_stats=filtered["summary"],
+        )
+        receipt_id = create_result["receipt_id"]
+
+        resume_result = self.cabinet.resume_with_receipt(
+            receipt_id, "resume_user"
+        )
+        self.assertTrue(resume_result["success"])
+
+        export_result = resume_result.get("export_result")
+        self.assertIsNotNone(export_result)
+        self.assertTrue(export_result["success"])
+        self.assertEqual(export_result["total_changes"], 1)
+
+        updated_receipt = self.db.get_export_receipt(receipt_id)
+        self.assertEqual(updated_receipt["status"], RECEIPT_STATUS_RESUMED)
+        self.assertIsNotNone(updated_receipt["file_hash"])
+
+    def test_resume_uses_log_ids_directly(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        all_changes = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            operator="test_user",
+        )
+        all_log_ids = [l["id"] for l in all_changes["logs"]]
+
+        selected_ids = all_log_ids[:1]
+        target = self._create_target_file(name="selected_export.json")
+
+        create_result = self.cabinet.create_receipt_from_export(
+            operator="test_user",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot={"batch_id": second_batch_id},
+            log_ids=selected_ids,
+            summary_stats={"total_changes": 1},
+        )
+        receipt_id = create_result["receipt_id"]
+
+        resume_result = self.cabinet.resume_with_receipt(
+            receipt_id, "resume_user"
+        )
+        self.assertTrue(resume_result["success"])
+        export_result = resume_result.get("export_result")
+        self.assertEqual(export_result["total_changes"], 1)
+
+
+class TestSingleSourceOfTruth(_BaseReceiptTest):
+    def test_receipt_contains_all_export_context(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+        filtered = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            change_type="status_change",
+            operator="test_user",
+        )
+        log_ids = [l["id"] for l in filtered["logs"]]
+
+        target = self._create_target_file(name="sot_test.json")
+        filter_snapshot = {
+            "batch_id": second_batch_id,
+            "change_type": "status_change",
+            "impact_type": None,
+            "processing_status": "pending",
+        }
+
+        create_result = self.cabinet.create_receipt_from_export(
+            operator="test_exporter",
+            batch_id=second_batch_id,
+            target_file=target,
+            export_format="json",
+            filter_snapshot=filter_snapshot,
+            log_ids=log_ids,
+            summary_stats=filtered["summary"],
+        )
+        receipt_id = create_result["receipt_id"]
+
+        receipt = self.db.get_export_receipt(receipt_id)
+
+        required_fields = [
+            "receipt_id", "status", "operator", "target_file",
+            "export_format", "record_fingerprints", "filter_snapshot",
+            "summary_stats", "file_hash", "export_dir", "working_dir",
+            "batch_id", "hit_count", "log_ids",
+        ]
+        for field in required_fields:
+            self.assertIn(field, receipt, f"回执缺少字段: {field}")
+
+        self.assertEqual(receipt["hit_count"], len(log_ids))
+        self.assertEqual(len(receipt["record_fingerprints"]), len(log_ids))
+        self.assertEqual(receipt["filter_snapshot"]["change_type"], "status_change")
+
+    def test_latest_receipt_is_single_source(self):
+        inv_result, _, _ = self._import_and_match()
+
+        updated_csv = os.path.join(self.test_dir, "invoices_updated.csv")
+        with open(updated_csv, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_INVOICES_UPDATED_CSV)
+        second_inv_result = self.importer.import_invoices(updated_csv, "test_user")
+        second_batch_id = second_inv_result["batch_id"]
+
+        from invoice_reconciler.core.change_tracker import ChangeTracker
+        tracker = ChangeTracker(self.config, self.db)
+
+        filtered1 = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            change_type="status_change",
+            operator="test_user",
+        )
+        target1 = self._create_target_file(name="export1.json")
+        self.cabinet.create_receipt_from_export(
+            operator="user1",
+            batch_id=second_batch_id,
+            target_file=target1,
+            export_format="json",
+            filter_snapshot={"batch_id": second_batch_id, "change_type": "status_change"},
+            log_ids=[l["id"] for l in filtered1["logs"]],
+            summary_stats=filtered1["summary"],
+        )
+
+        filtered2 = tracker.get_filtered_changes(
+            batch_id=second_batch_id,
+            change_type="new_record",
+            operator="test_user",
+        )
+        target2 = self._create_target_file(name="export2.json")
+        self.cabinet.create_receipt_from_export(
+            operator="user2",
+            batch_id=second_batch_id,
+            target_file=target2,
+            export_format="json",
+            filter_snapshot={"batch_id": second_batch_id, "change_type": "new_record"},
+            log_ids=[l["id"] for l in filtered2["logs"]],
+            summary_stats=filtered2["summary"],
+        )
+
+        latest = self.cabinet.find_latest_receipt()
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["operator"], "user2")
+        self.assertEqual(latest["hit_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
