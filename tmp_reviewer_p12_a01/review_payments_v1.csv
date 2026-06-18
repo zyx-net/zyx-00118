@@ -1,0 +1,4 @@
+payment_no,payment_date,customer,amount
+PAY2001,2024-01-10,Alpha Co,1000.00
+PAY2002,2024-01-11,Beta Co,2500.00
+PAY2003,2024-01-12,Gamma Co,1800.00

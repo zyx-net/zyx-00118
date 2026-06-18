@@ -1,0 +1,5 @@
+invoice_no,invoice_date,customer,amount,status
+INV1001,2024-01-10,Alpha Co,1000.00,normal
+INV1002,2024-01-11,Beta Co,2600.00,normal
+INV1003,2024-01-12,Gamma Co,1800.00,void
+INV1004,2024-01-13,Delta Co,900.00,normal

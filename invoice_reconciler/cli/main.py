@@ -67,6 +67,17 @@ from invoice_reconciler.core.handover import (
     HANDOVER_CONFLICT_LABELS,
     HANDOVER_ACTION_LABELS,
 )
+from invoice_reconciler.core.receipt_cabinet import (
+    ExportReceiptCabinet,
+    RECEIPT_STATUS_ACTIVE,
+    RECEIPT_STATUS_RESUMED,
+    RECEIPT_STATUS_ABANDONED,
+    RECEIPT_STATUS_SUPERSEDED,
+    RECEIPT_STATUS_LABELS,
+    RECEIPT_EVENT_LABELS,
+    INTERCEPT_LABELS,
+    HANDLE_LABELS,
+)
 
 
 def get_current_user() -> str:
@@ -219,7 +230,53 @@ def cli(ctx, config_path):
             "change_tracker": ChangeTracker(config, db),
             "handover": handover,
             "playback_center": playback_center,
+            "receipt_cabinet": ExportReceiptCabinet(config, db),
         }
+
+        receipt_cabinet = ctx.obj["receipt_cabinet"]
+        latest_receipt = receipt_cabinet.find_latest_receipt()
+        if latest_receipt:
+            rid = latest_receipt.get("receipt_id", "?")
+            r_status = latest_receipt.get("status", "-")
+            r_op = latest_receipt.get("operator", "-")
+            r_target = latest_receipt.get("target_file", "-")
+            r_format = latest_receipt.get("export_format", "-")
+            r_hits = latest_receipt.get("hit_count", 0)
+            r_time = latest_receipt.get("exported_at", "-")
+            r_status_label = RECEIPT_STATUS_LABELS.get(r_status, r_status)
+
+            check = receipt_cabinet.check_interceptions(rid)
+            has_issues = check.get("interception_count", 0) > 0
+
+            click.echo(click.style(
+                f"[导出回执] 检测到上次导出回执: {rid} "
+                f"(状态: {r_status_label}, 操作人: {r_op}, "
+                f"记录数: {r_hits}, 格式: {r_format})",
+                fg="cyan", bold=True
+            ))
+            click.echo(click.style(
+                f"  导出时间: {r_time} | 目标: {r_target}",
+                fg="cyan"
+            ))
+            if has_issues:
+                click.echo(click.style(
+                    f"  ⚠ 检测到 {check['interception_count']} 个拦截项:",
+                    fg="red", bold=True
+                ))
+                for i in check["interceptions"]:
+                    click.echo(click.style(
+                        f"    • [{i['severity']}] {i['label']}: {i['detail']}",
+                        fg="red" if i['severity'] == 'critical' else "yellow"
+                    ))
+                click.echo(click.style(
+                    f"  处理: receipt show {rid} | receipt compare {rid} | receipt handle {rid}",
+                    fg="cyan"
+                ))
+            else:
+                click.echo(click.style(
+                    f"  续导: receipt resume {rid} | 对比: receipt compare {rid}",
+                    fg="cyan"
+                ))
     except Exception as e:
         click.echo(f"初始化失败: {e}", err=True)
         sys.exit(1)
@@ -2911,6 +2968,374 @@ def handover_detailed_timeline(ctx, package_id, limit):
             else:
                 click.echo(f"     详情: {str(details)[:80]}")
         click.echo()
+
+
+@cli.group()
+def receipt():
+    """导出回执档案柜"""
+    pass
+
+
+@receipt.command("create")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--target-file", required=True, help="目标导出文件路径")
+@click.option("--format", "export_format", type=click.Choice(["json", "csv"]),
+              default="json", help="导出格式")
+@click.option("--batch-id", type=int, default=None, help="关联批次ID")
+@click.pass_context
+def receipt_create(ctx, operator, target_file, export_format, batch_id):
+    """创建导出回执"""
+    cabinet = ctx.obj["receipt_cabinet"]
+    operator = operator or get_current_user()
+
+    result = cabinet.create_receipt(
+        operator=operator,
+        target_file=target_file,
+        export_format=export_format,
+        batch_id=batch_id,
+    )
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] 创建回执失败", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 导出回执已创建: {result['receipt_id']}", fg="green", bold=True))
+    click.echo(f"配置哈希: {result['config_hash']}")
+    click.echo(f"状态: {result['status']}")
+    click.echo(f"目标文件: {result['target_file']}")
+    click.echo(f"格式: {result['export_format']}")
+    click.echo(f"命中记录数: {result['hit_count']}")
+    click.echo(f"导出时间: {result['exported_at']}")
+
+
+@receipt.command("show")
+@click.argument("receipt_id")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def receipt_show(ctx, receipt_id, operator):
+    """查看导出回执详情"""
+    cabinet = ctx.obj["receipt_cabinet"]
+    operator = operator or get_current_user()
+
+    result = cabinet.read_receipt(receipt_id, operator)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"=== 导出回执: {receipt_id} ===", fg="cyan", bold=True))
+    click.echo(f"状态: {RECEIPT_STATUS_LABELS.get(result['status'], result['status'])}")
+    click.echo(f"操作者: {result.get('operator', '-')}")
+    click.echo(f"导出时间: {result.get('exported_at', '-')}")
+    click.echo(f"创建时间: {result.get('created_at', '-')}")
+    click.echo()
+
+    click.echo(click.style("--- 导出信息 ---", fg="yellow"))
+    click.echo(f"  目标文件: {result.get('target_file', '-')}")
+    click.echo(f"  导出格式: {result.get('export_format', '-')}")
+    click.echo(f"  命中记录数: {result.get('hit_count', 0)}")
+    click.echo(f"  关联批次: #{result.get('batch_id', '-')}")
+    click.echo(f"  导出目录: {result.get('export_dir', '-')}")
+    click.echo(f"  工作目录: {result.get('working_dir', '-')}")
+    click.echo()
+
+    file_alive = result.get("file_alive", True)
+    file_modified = result.get("file_modified", False)
+    click.echo(click.style("--- 文件存活状态 ---", fg="yellow"))
+    click.echo(f"  文件存在: {'是' if file_alive else '否'}")
+    click.echo(f"  文件被修改: {'是' if file_modified else '否'}")
+    if result.get("original_file_hash"):
+        click.echo(f"  原始哈希: {result['original_file_hash']}")
+    if result.get("current_file_hash"):
+        click.echo(f"  当前哈希: {result['current_file_hash']}")
+    click.echo()
+
+    filter_snapshot = result.get("filter_snapshot", {})
+    if filter_snapshot:
+        click.echo(click.style("--- 筛选快照 ---", fg="yellow"))
+        for k, v in filter_snapshot.items():
+            if v is not None and v is not False:
+                click.echo(f"  {k}: {v}")
+        click.echo()
+
+    summary_stats = result.get("summary_stats", {})
+    if summary_stats:
+        click.echo(click.style("--- 摘要统计 ---", fg="yellow"))
+        for k, v in summary_stats.items():
+            if v is not None:
+                click.echo(f"  {k}: {v}")
+        click.echo()
+
+    subsequent_actions = result.get("subsequent_actions", [])
+    if subsequent_actions:
+        click.echo(click.style("--- 可执行动作 ---", fg="green"))
+        for action in subsequent_actions:
+            click.echo(f"  • {action}")
+        click.echo()
+
+    if not file_alive:
+        click.echo(click.style("⚠ 目标文件已不存在，续导前需重绑目标或另存副本", fg="red", bold=True))
+    elif file_modified:
+        click.echo(click.style("⚠ 目标文件已被修改，续导可能覆盖变更", fg="yellow", bold=True))
+
+
+@receipt.command("list")
+@click.option("--all", "show_all", is_flag=True, help="包含已放弃的回执")
+@click.pass_context
+def receipt_list(ctx, show_all):
+    """列出导出回执"""
+    cabinet = ctx.obj["receipt_cabinet"]
+
+    receipts = cabinet.list_receipts(include_inactive=show_all)
+
+    if not receipts:
+        click.echo("暂无导出回执")
+        return
+
+    headers = ["回执ID", "状态", "操作人", "目标文件", "格式", "记录数", "导出时间"]
+    rows = []
+    for r in receipts:
+        r_status = RECEIPT_STATUS_LABELS.get(r.get("status", ""), r.get("status", "-"))
+        rows.append([
+            r.get("receipt_id", "-"),
+            r_status,
+            r.get("operator") or "-",
+            (r.get("target_file") or "")[:40],
+            r.get("export_format", "-"),
+            r.get("hit_count", 0),
+            r.get("exported_at", "-"),
+        ])
+    print_table(headers, rows)
+
+
+@receipt.command("compare")
+@click.argument("receipt_id")
+@click.option("--operator", default=None, help="操作者")
+@click.pass_context
+def receipt_compare(ctx, receipt_id, operator):
+    """回执对比：对比回执中的导出目标与当前状态"""
+    cabinet = ctx.obj["receipt_cabinet"]
+    operator = operator or get_current_user()
+
+    result = cabinet.compare_receipt(receipt_id, operator)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    if result["all_match"]:
+        click.echo(click.style(f"[OK] 回执 {receipt_id} 与当前状态完全一致", fg="green"))
+        return
+
+    click.echo(click.style(
+        f"=== 回执对比: {receipt_id} ({result['mismatch_count']} 处差异) ===",
+        fg="cyan", bold=True
+    ))
+
+    for comp in result["comparisons"]:
+        label = comp.get("label", comp["field"])
+        match_icon = "✓" if comp.get("match", True) else "✗"
+        color = "green" if comp.get("match", True) else "red"
+        click.echo(click.style(f"\n  [{label}] {match_icon}", fg=color))
+
+        if comp["field"] == "record_fingerprints":
+            click.echo(f"    回执记录数: {comp.get('receipt_count', '-')}")
+            click.echo(f"    当前记录数: {comp.get('current_count', '-')}")
+            click.echo(f"    新增: {comp.get('added_count', 0)}, 缺失: {comp.get('removed_count', 0)}")
+            if comp.get("detail"):
+                click.echo(f"    详情: {comp['detail']}")
+        elif comp["field"] == "target_file":
+            click.echo(f"    文件存在: {'是' if comp.get('file_alive') else '否'}")
+            click.echo(f"    文件被修改: {'是' if comp.get('file_modified') else '否'}")
+            if comp.get("receipt_hash"):
+                click.echo(f"    回执哈希: {comp['receipt_hash']}")
+            if comp.get("current_hash"):
+                click.echo(f"    当前哈希: {comp['current_hash']}")
+        else:
+            if comp.get("receipt") is not None:
+                click.echo(f"    回执: {json.dumps(comp['receipt'], ensure_ascii=False)[:80]}")
+            if comp.get("current") is not None:
+                click.echo(f"    当前: {json.dumps(comp['current'], ensure_ascii=False)[:80]}")
+
+
+@receipt.command("check")
+@click.argument("receipt_id")
+@click.pass_context
+def receipt_check(ctx, receipt_id):
+    """检查回执拦截项"""
+    cabinet = ctx.obj["receipt_cabinet"]
+
+    result = cabinet.check_interceptions(receipt_id)
+
+    if not result["success"]:
+        click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+        sys.exit(1)
+
+    if result["interception_count"] == 0:
+        click.echo(click.style(f"[OK] 回执 {receipt_id} 无拦截项，可以安全续导", fg="green"))
+        return
+
+    click.echo(click.style(
+        f"[!!] 回执 {receipt_id} 存在 {result['interception_count']} 个拦截项:",
+        fg="red", bold=True
+    ))
+    for i in result["interceptions"]:
+        severity_icon = "🔴" if i["severity"] == "critical" else ("🟡" if i["severity"] == "high" else "🟠")
+        click.echo(click.style(
+            f"  {severity_icon} [{i['severity']}] {i['label']}: {i['detail']}",
+            fg="red" if i["severity"] == "critical" else "yellow"
+        ))
+
+    click.echo()
+    if result["can_resume"]:
+        click.echo(click.style("可使用 --force 强制续导，或先处理拦截项", fg="yellow"))
+    else:
+        click.echo(click.style("存在严重拦截项，无法强制续导，请先处理", fg="red", bold=True))
+
+    click.echo()
+    click.echo("处理选项:")
+    handling = cabinet.get_handling_options(receipt_id)
+    for opt in handling.get("handling_options", []):
+        avail_icon = "✓" if opt.get("available") else "✗"
+        click.echo(f"  {avail_icon} {opt['label']}: {opt['description']}")
+
+
+@receipt.command("handle")
+@click.argument("receipt_id")
+@click.argument("action", type=click.Choice(["save_copy", "abandon", "rebind", "cleanup"]))
+@click.option("--operator", default=None, help="操作者")
+@click.option("--new-export-dir", default=None, help="重绑的新导出目录")
+@click.option("--new-target-file", default=None, help="重绑的新目标文件")
+@click.pass_context
+def receipt_handle(ctx, receipt_id, action, operator, new_export_dir, new_target_file):
+    """处理回执拦截项（另存副本/放弃恢复/重绑目标/清理失效）"""
+    cabinet = ctx.obj["receipt_cabinet"]
+    operator = operator or get_current_user()
+
+    if action == "save_copy":
+        result = cabinet.handle_save_copy(receipt_id, operator)
+        if result["success"]:
+            click.echo(click.style(f"[OK] 已另存副本: {result['new_receipt_id']}", fg="green"))
+            click.echo(f"新目标: {result['new_target']}")
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+            sys.exit(1)
+
+    elif action == "abandon":
+        result = cabinet.handle_abandon(receipt_id, operator)
+        if result["success"]:
+            click.echo(click.style(f"[OK] 已放弃恢复: {receipt_id}", fg="yellow"))
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+            sys.exit(1)
+
+    elif action == "rebind":
+        if not new_export_dir and not new_target_file:
+            click.echo(click.style("请指定 --new-export-dir 或 --new-target-file", fg="red"), err=True)
+            sys.exit(1)
+        result = cabinet.handle_rebind(receipt_id, operator,
+                                       new_export_dir=new_export_dir,
+                                       new_target_file=new_target_file)
+        if result["success"]:
+            click.echo(click.style(f"[OK] 已重绑目标: {receipt_id}", fg="green"))
+            for k, v in result.get("updates", {}).items():
+                click.echo(f"  {k}: {v}")
+        else:
+            click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
+            sys.exit(1)
+
+    elif action == "cleanup":
+        result = cabinet.handle_cleanup(operator=operator)
+        if result["removed_count"] > 0:
+            click.echo(click.style(f"[OK] 已清理 {result['removed_count']} 个失效回执", fg="green"))
+            for detail in result.get("invalid_details", []):
+                reasons = ", ".join(detail["reasons"])
+                click.echo(f"  • {detail['receipt_id']}: {reasons}")
+        else:
+            click.echo(click.style("[OK] 无失效回执", fg="green"))
+
+
+@receipt.command("resume")
+@click.argument("receipt_id")
+@click.option("--operator", default=None, help="操作者")
+@click.option("--force", is_flag=True, default=False, help="强制续导（忽略非严重拦截项）")
+@click.pass_context
+def receipt_resume(ctx, receipt_id, operator, force):
+    """基于回执续导出"""
+    cabinet = ctx.obj["receipt_cabinet"]
+    operator = operator or get_current_user()
+
+    result = cabinet.resume_with_receipt(receipt_id, operator, force=force)
+
+    if not result["success"]:
+        if result.get("interceptions"):
+            click.echo(click.style(
+                f"[!!] 存在 {len(result['interceptions'])} 个拦截项，无法续导:",
+                fg="red", bold=True
+            ))
+            for i in result["interceptions"]:
+                click.echo(click.style(
+                    f"  • [{i['severity']}] {i['label']}: {i['detail']}",
+                    fg="red" if i["severity"] == "critical" else "yellow"
+                ))
+            if result.get("can_force"):
+                click.echo(click.style("使用 --force 强制续导（仅非严重拦截项）", fg="yellow"))
+            else:
+                click.echo(click.style("存在严重拦截项，请先处理: receipt handle", fg="red"))
+        else:
+            click.echo(click.style(f"[!!] {result.get('message', '续导失败')}", fg="red"), err=True)
+        sys.exit(1)
+
+    click.echo(click.style(f"[OK] 续导完成: {receipt_id}", fg="green", bold=True))
+    if result.get("forced"):
+        click.echo(click.style("  (已强制忽略拦截项)", fg="yellow"))
+
+    export_result = result.get("export_result")
+    if export_result:
+        if export_result.get("success"):
+            click.echo(click.style("--- 导出结果 ---", fg="green"))
+            click.echo(f"  文件路径: {export_result.get('file_path', '-')}")
+            click.echo(f"  格式: {export_result.get('format', '-')}")
+            if export_result.get("total_changes") is not None:
+                click.echo(f"  记录数: {export_result['total_changes']}")
+        else:
+            click.echo(click.style("--- 导出结果 ---", fg="yellow"))
+            click.echo(f"  状态: 部分成功")
+            click.echo(f"  信息: {export_result.get('message', '未知')}")
+
+
+@receipt.command("timeline")
+@click.argument("receipt_id")
+@click.option("--limit", type=int, default=20, help="显示条数")
+@click.pass_context
+def receipt_timeline(ctx, receipt_id, limit):
+    """查看回执操作时间线"""
+    cabinet = ctx.obj["receipt_cabinet"]
+
+    events = cabinet.get_timeline(receipt_id, limit=limit)
+
+    if not events:
+        click.echo("暂无操作记录")
+        return
+
+    click.echo(click.style(f"=== 回执时间线: {receipt_id} ===", fg="cyan", bold=True))
+    for evt in events:
+        status_icon = "✓" if evt["status"] == "success" else ("⚠" if evt["status"] == "partial" else "✗")
+        color = "green" if evt["status"] == "success" else ("yellow" if evt["status"] == "partial" else "red")
+        label = evt.get("event_label") or RECEIPT_EVENT_LABELS.get(evt["event_type"], evt["event_type"])
+        click.echo(click.style(
+            f"  [{evt['created_at']}] {status_icon} {label}",
+            fg=color
+        ))
+        if evt.get("operator"):
+            click.echo(f"     操作人: {evt['operator']}")
+        if evt.get("result_summary"):
+            click.echo(f"     结果: {evt['result_summary']}")
+        if evt.get("error_message"):
+            click.echo(click.style(f"     错误: {evt['error_message']}", fg="red"))
+        if evt.get("event_details") and isinstance(evt["event_details"], dict):
+            detail_str = ", ".join(f"{k}={v}" for k, v in list(evt["event_details"].items())[:5])
+            click.echo(f"     详情: {detail_str}")
 
 
 if __name__ == "__main__":

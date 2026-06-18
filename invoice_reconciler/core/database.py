@@ -407,6 +407,53 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_handover_events_package ON handover_events(package_id);
                 CREATE INDEX IF NOT EXISTS idx_handover_events_type ON handover_events(event_type);
                 CREATE INDEX IF NOT EXISTS idx_handover_events_created ON handover_events(created_at);
+
+                CREATE TABLE IF NOT EXISTS export_receipts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receipt_id TEXT UNIQUE NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    operator TEXT NOT NULL,
+                    target_file TEXT NOT NULL,
+                    export_format TEXT NOT NULL DEFAULT 'json',
+                    record_fingerprints TEXT NOT NULL,
+                    filter_snapshot TEXT,
+                    summary_stats TEXT,
+                    file_hash TEXT,
+                    export_dir TEXT,
+                    working_dir TEXT,
+                    subsequent_actions TEXT,
+                    session_id TEXT,
+                    batch_id INTEGER,
+                    hit_count INTEGER DEFAULT 0,
+                    exported_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_export_receipts_id ON export_receipts(receipt_id);
+                CREATE INDEX IF NOT EXISTS idx_export_receipts_config ON export_receipts(config_hash);
+                CREATE INDEX IF NOT EXISTS idx_export_receipts_status ON export_receipts(status);
+                CREATE INDEX IF NOT EXISTS idx_export_receipts_batch ON export_receipts(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_export_receipts_session ON export_receipts(session_id);
+
+                CREATE TABLE IF NOT EXISTS export_receipt_timeline (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receipt_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_label TEXT,
+                    operator TEXT,
+                    status TEXT NOT NULL DEFAULT 'success',
+                    result_summary TEXT,
+                    event_details TEXT,
+                    error_message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (receipt_id) REFERENCES export_receipts(receipt_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_receipt_timeline_receipt ON export_receipt_timeline(receipt_id);
+                CREATE INDEX IF NOT EXISTS idx_receipt_timeline_type ON export_receipt_timeline(event_type);
+                CREATE INDEX IF NOT EXISTS idx_receipt_timeline_created ON export_receipt_timeline(created_at);
             """)
 
     @staticmethod
@@ -2215,6 +2262,174 @@ class Database:
             for row in rows:
                 row_dict = dict(row)
                 if row_dict.get("event_details"):
+                    try:
+                        row_dict["event_details"] = json.loads(row_dict["event_details"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                result.append(row_dict)
+            return result
+
+    def save_export_receipt(self, receipt_id: str, config_hash: str,
+                            receipt_data: Dict) -> None:
+        record_fingerprints = json.dumps(
+            receipt_data.get("record_fingerprints", []), ensure_ascii=False
+        )
+        filter_snapshot = json.dumps(
+            receipt_data.get("filter_snapshot", {}), ensure_ascii=False
+        ) if receipt_data.get("filter_snapshot") is not None else None
+        summary_stats = json.dumps(
+            receipt_data.get("summary_stats", {}), ensure_ascii=False
+        ) if receipt_data.get("summary_stats") is not None else None
+        subsequent_actions = json.dumps(
+            receipt_data.get("subsequent_actions", []), ensure_ascii=False
+        ) if receipt_data.get("subsequent_actions") is not None else None
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO export_receipts
+                   (receipt_id, config_hash, status, operator, target_file,
+                    export_format, record_fingerprints, filter_snapshot,
+                    summary_stats, file_hash, export_dir, working_dir,
+                    subsequent_actions, session_id, batch_id, hit_count,
+                    exported_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(receipt_id) DO UPDATE SET
+                   config_hash = excluded.config_hash,
+                   status = excluded.status,
+                   operator = excluded.operator,
+                   target_file = excluded.target_file,
+                   export_format = excluded.export_format,
+                   record_fingerprints = excluded.record_fingerprints,
+                   filter_snapshot = excluded.filter_snapshot,
+                   summary_stats = excluded.summary_stats,
+                   file_hash = excluded.file_hash,
+                   export_dir = excluded.export_dir,
+                   working_dir = excluded.working_dir,
+                   subsequent_actions = excluded.subsequent_actions,
+                   session_id = excluded.session_id,
+                   batch_id = excluded.batch_id,
+                   hit_count = excluded.hit_count,
+                   exported_at = excluded.exported_at,
+                   updated_at = CURRENT_TIMESTAMP""",
+                (receipt_id, config_hash,
+                 receipt_data.get("status", "active"),
+                 receipt_data.get("operator", ""),
+                 receipt_data.get("target_file", ""),
+                 receipt_data.get("export_format", "json"),
+                 record_fingerprints, filter_snapshot, summary_stats,
+                 receipt_data.get("file_hash"),
+                 receipt_data.get("export_dir"),
+                 receipt_data.get("working_dir"),
+                 subsequent_actions,
+                 receipt_data.get("session_id"),
+                 receipt_data.get("batch_id"),
+                 receipt_data.get("hit_count", 0),
+                 receipt_data.get("exported_at"))
+            )
+
+    def get_export_receipt(self, receipt_id: str) -> Optional[Dict]:
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM export_receipts WHERE receipt_id = ?",
+                (receipt_id,)
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            for field in ("record_fingerprints", "filter_snapshot",
+                          "summary_stats", "subsequent_actions"):
+                if result.get(field) and isinstance(result[field], str):
+                    try:
+                        result[field] = json.loads(result[field])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return result
+
+    def list_export_receipts(self, config_hash: str,
+                             include_inactive: bool = False,
+                             limit: int = 50) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = "SELECT * FROM export_receipts WHERE config_hash = ?"
+            params: list = [config_hash]
+            if not include_inactive:
+                sql += " AND status != 'abandoned'"
+            sql += " ORDER BY exported_at DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                for field in ("record_fingerprints", "filter_snapshot",
+                              "summary_stats", "subsequent_actions"):
+                    if row_dict.get(field) and isinstance(row_dict[field], str):
+                        try:
+                            row_dict[field] = json.loads(row_dict[field])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                result.append(row_dict)
+            return result
+
+    def update_export_receipt_status(self, receipt_id: str,
+                                     status: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                """UPDATE export_receipts SET status = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE receipt_id = ?""",
+                (status, receipt_id)
+            )
+
+    def update_export_receipt_field(self, receipt_id: str,
+                                    field: str, value: Any) -> None:
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+        with self._get_conn() as conn:
+            conn.execute(
+                f"""UPDATE export_receipts SET {field} = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE receipt_id = ?""",
+                (value, receipt_id)
+            )
+
+    def delete_export_receipt(self, receipt_id: str) -> None:
+        with self._get_conn() as conn:
+            conn.execute(
+                "DELETE FROM export_receipt_timeline WHERE receipt_id = ?",
+                (receipt_id,)
+            )
+            conn.execute(
+                "DELETE FROM export_receipts WHERE receipt_id = ?",
+                (receipt_id,)
+            )
+
+    def log_receipt_timeline_event(self, receipt_id: str,
+                                   event_type: str, operator: str,
+                                   status: str = "success",
+                                   result_summary: str = None,
+                                   event_details: Dict = None,
+                                   error_message: str = None,
+                                   event_label: str = None) -> None:
+        details_str = json.dumps(event_details, ensure_ascii=False, default=str) if event_details else None
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO export_receipt_timeline
+                   (receipt_id, event_type, event_label, operator, status,
+                    result_summary, event_details, error_message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (receipt_id, event_type, event_label, operator, status,
+                 result_summary, details_str, error_message)
+            )
+
+    def get_receipt_timeline(self, receipt_id: str,
+                             limit: int = 100) -> List[Dict]:
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """SELECT * FROM export_receipt_timeline
+                   WHERE receipt_id = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (receipt_id, limit)
+            ).fetchall()
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict.get("event_details") and isinstance(row_dict["event_details"], str):
                     try:
                         row_dict["event_details"] = json.loads(row_dict["event_details"])
                     except (json.JSONDecodeError, TypeError):
