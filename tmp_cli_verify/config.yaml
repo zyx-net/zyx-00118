@@ -12,8 +12,8 @@ payment_required_columns:
 - customer
 - amount
 export_format: xlsx
-db_path: d:\workSpace\AI__SPACE\zyx-00118\tmp_cli_verify\reconciler.db
-export_dir: d:\workSpace\AI__SPACE\zyx-00118\tmp_cli_verify\exports
+db_path: D:\workSpace\AI__SPACE\zyx-00118\tmp_cli_verify\reconciler.db
+export_dir: D:\workSpace\AI__SPACE\zyx-00118\tmp_cli_verify\exports
 lock_timeout_seconds: 3600
 default_user_role: reviewer
 admin_users:

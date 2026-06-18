@@ -1264,3 +1264,110 @@ python -m unittest tests.test_batch_workbench -v
 > 6. 第15.5步 batch summary 中的 progress_percent ∈ [0, 100]，各状态计数≥0 ✅
 > 7. 第15.5步 batch restore 正确返回 has_state=true，last_batch_id=上次选择的批次 ✅
 > 8. 第16步所有 36 个测试显示 `OK` ✅
+
+## 最小复现：cwd 路径漂移问题
+
+### 问题描述
+同一份配置文件在不同工作目录执行时，`db_path` 和 `export_dir` 会按当前目录解析，导致读到新建空库，receipt list 变空，已导入数据无法稳定续传。
+
+### 复现步骤（Windows PowerShell）
+
+```powershell
+# 1. 准备环境
+cd d:\workSpace\AI__SPACE\zyx-00118
+
+# 2. 创建两个测试目录
+mkdir cwd_test_a
+mkdir cwd_test_b
+
+# 3. 在 cwd_test_a 中初始化数据
+cd cwd_test_a
+python -m invoice_reconciler.cli.main import invoices ../invoice_reconciler/data/sample_invoices.csv --operator test
+python -m invoice_reconciler.cli.main import payments ../invoice_reconciler/data/sample_payments.csv --operator test
+python -m invoice_reconciler.cli.main match --operator test
+python -m invoice_reconciler.cli.main import invoices ../invoice_reconciler/data/sample_invoices_updated.csv --operator test
+
+# 4. 在 cwd_test_a 中导出并查看回执
+python -m invoice_reconciler.cli.main batch export-changes 3 --operator test --format json --change-type status_change
+python -m invoice_reconciler.cli.main receipt list
+# ✅ 应看到回执列表（如 E202606180001）
+
+# 5. 切换到 cwd_test_b，执行同样的 receipt list 命令
+cd ../cwd_test_b
+python -m invoice_reconciler.cli.main receipt list
+# ❌ 问题：此时返回空列表，因为 db_path 是相对路径，在 cwd_test_b 下创建了新的空数据库
+
+# 6. 验证：两个目录下各有一个独立的数据库文件
+ls cwd_test_a\invoice_reconciler\data\reconciler.db
+ls cwd_test_b\invoice_reconciler\data\reconciler.db
+# 这是两个完全不同的数据库文件
+```
+
+### 临时解决方案
+在 `config.yaml` 中使用**绝对路径**：
+
+```yaml
+db_path: D:\workSpace\AI__SPACE\zyx-00118\invoice_reconciler\data\reconciler.db
+export_dir: D:\workSpace\AI__SPACE\zyx-00118\invoice_reconciler\exports
+```
+
+## 回归测试运行指南
+
+### 测试套件说明
+新增的回归测试套件 `tests/test_cwd_path_regression.py` 覆盖以下场景：
+
+| 测试用例 | 说明 |
+|----------|------|
+| `test_absolute_paths_same_data_across_cwd` | 绝对路径配置在不同 cwd 下读取同一份数据 |
+| `test_relative_paths_drift_detection` | 相对路径配置发生漂移时给出明确失败（静默建空库检测） |
+| `test_cross_cwd_resume_export` | 跨 cwd 续导导出（receipt resume + batch resume-export） |
+| `test_export_file_modification_intercept_and_force` | 导出文件被改动时拦截，--force 放行 |
+| `test_zero_records_assertion_fails_fast` | 命中 0 条记录时断言快速失败 |
+| `test_command_error_fails_fast` | 命令执行错误时快速失败 |
+| `test_relative_path_drift_subprocess` | subprocess 真实场景路径漂移复现 |
+
+### 运行回归测试
+
+```bash
+# 运行所有 cwd 路径回归测试
+python -m pytest tests/test_cwd_path_regression.py -v
+
+# 运行特定测试用例
+python -m pytest tests/test_cwd_path_regression.py::TestCWDPathRegression::test_absolute_paths_same_data_across_cwd -v
+
+# 运行所有测试（包含原有测试）
+python -m pytest tests/ -v
+```
+
+### 预期结果
+
+- **`test_absolute_paths_same_data_across_cwd`**：✅ 通过（绝对路径正确）
+- **`test_relative_paths_drift_detection`**：❌ 失败（这是预期的，用于检测路径漂移 Bug）
+  - 失败信息会详细说明两个 cwd 下解析出的不同数据库路径
+  - 这是**故意设计的测试**，用于卡住回归，防止 Bug 被引入
+- **其他测试**：✅ 通过
+
+### 验证脚本运行
+
+收紧的验证脚本 `tmp_cli_verify/run_verify.py` 会在以下情况立即失败：
+- 命令执行错误（exit_code != 0）
+- 查询命中 0 条记录
+- 任何断言失败
+
+```bash
+# 运行完整端到端验证
+python tmp_cli_verify/run_verify.py
+```
+
+### 持续集成建议
+
+在 CI 流水线中加入：
+
+```bash
+# 1. 运行绝对路径相关测试（必须通过）
+python -m pytest tests/test_cwd_path_regression.py -v -k "absolute or cross_cwd or modification or zero or command"
+
+# 2. 运行漂移检测测试（预期失败，用于监控 Bug 状态）
+# 如果此测试意外通过，说明路径解析逻辑已被修复
+python -m pytest tests/test_cwd_path_regression.py::TestCWDPathRegression::test_relative_paths_drift_detection -v || echo "漂移检测测试按预期失败，Bug 仍存在"
+```
