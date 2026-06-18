@@ -1084,6 +1084,77 @@ class TestBatchChangesCLIEntrypoints(unittest.TestCase):
 
         del db
 
+    def test_four_entrypoints_handoff_chain(self):
+        """
+        交接文档四个入口全链路校验：
+        1. batch changes (不带 batch_id) → 默认查看全部变更
+        2. batch changes --batch-id X   → 按批次缩小范围
+        3. batch export-changes X       → 导出变更日志
+        4. batch resume-export          → 重启后继续导出不丢上下文
+
+        专门卡住"文档承诺了但实际跑不通"的缺口。
+        """
+        db = Database(self.db_path)
+        workbench = BatchWorkbench(self.config, db)
+        workbench.clear_workbench_state()
+        del db
+        del workbench
+
+        result1 = self._run_cli(["batch", "changes"])
+        self.assertEqual(result1.exit_code, 0,
+                        f"入口1失败: batch changes 不带参数应正常运行，stderr={result1.stderr}")
+        self.assertIn("变更记录", result1.output)
+        self.assertIn("变更统计", result1.output)
+        self.assertIn("影响统计", result1.output)
+        self.assertIn("处理状态", result1.output)
+
+        result2 = self._run_cli(["batch", "changes", "--batch-id", str(self.batch_2_id)])
+        self.assertEqual(result2.exit_code, 0,
+                        f"入口2失败: batch changes --batch-id 应正常运行，stderr={result2.stderr}")
+        self.assertIn(str(self.batch_2_id), result2.output)
+        self.assertIn("变更记录", result2.output)
+
+        result3 = self._run_cli([
+            "batch", "export-changes", str(self.batch_2_id),
+            "--operator", "handover_test", "--format", "json",
+        ])
+        self.assertEqual(result3.exit_code, 0,
+                        f"入口3失败: batch export-changes 应正常运行，stderr={result3.stderr}")
+        self.assertIn("变更日志已导出", result3.output)
+        self.assertIn("格式: json", result3.output)
+
+        result3_csv = self._run_cli([
+            "batch", "export-changes", str(self.batch_2_id),
+            "--operator", "handover_test", "--format", "csv",
+        ])
+        self.assertEqual(result3_csv.exit_code, 0,
+                        f"入口3-CSV失败: batch export-changes csv 应正常运行，stderr={result3_csv.stderr}")
+        self.assertIn("变更日志已导出", result3_csv.output)
+
+        result4 = self._run_cli(["batch", "resume-export", "--operator", "handover_resume"])
+        self.assertEqual(result4.exit_code, 0,
+                        f"入口4失败: batch resume-export 应正常运行，stderr={result4.stderr}")
+        self.assertIn("使用上次导出上下文", result4.output)
+        self.assertIn(f"批次: #{self.batch_2_id}", result4.output)
+        self.assertIn("导出已完成", result4.output)
+
+        db2 = Database(self.db_path)
+        workbench2 = BatchWorkbench(self.config, db2)
+        export_ctx = workbench2.get_last_export_context()
+        self.assertIsNotNone(export_ctx,
+                            "导出后应能获取到导出上下文，用于重启恢复")
+        self.assertEqual(export_ctx.get("batch_id"), self.batch_2_id)
+        self.assertIn(export_ctx.get("format"), ["json", "csv"])
+        self.assertIsNotNone(export_ctx.get("exported_at"),
+                            "导出上下文应包含导出时间")
+
+        view_ctx = workbench2.get_last_change_view_context()
+        self.assertIsNotNone(view_ctx,
+                            "查看变更后应能获取到查看上下文，用于重启恢复")
+        self.assertEqual(view_ctx.get("batch_id"), self.batch_2_id)
+
+        del db2
+
 
 if __name__ == "__main__":
     unittest.main()

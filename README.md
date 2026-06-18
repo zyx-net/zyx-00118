@@ -28,6 +28,10 @@
 - **重启恢复上下文**：自动恢复上次打开的批次和筛选条件，避免重新找上下文
 - **导入冲突检测**：同一批次重新导入时检测新增记录、状态冲突、金额变更、重复处理
 - **冲突信息导出**：冲突和差异信息自动带入 JSON/CSV 导出，方便追溯
+- **批次变更追踪**：重新导入时自动记录 5 类变更（新增记录/状态变更/金额变更/关键字段变更/重复处理），支持按变更类型、影响类型、处理状态过滤
+- **影响分析**：自动识别变更对已确认/待确认/已撤销数据的影响程度（严重/影响已确认/影响待确认/影响已撤销/警告/无影响）
+- **变更日志导出**：JSON 和 CSV 双格式稳定输出变更前后摘要、操作者、时间、关联批次、处理状态，支持交接追溯
+- **导出上下文持久化**：程序重启后恢复上次导出上下文，`resume-export` 可一键继续导出不丢上下文
 
 ## 安装
 
@@ -321,6 +325,132 @@ python -m invoice_reconciler.cli.main batch restore
 python -m invoice_reconciler.cli.main batch clear-state
 ```
 
+### 15b. 变更追踪 - 重新导入后的完整交接链路
+
+> **变更追踪专为交接设计**：同一批次文件重新导入后，不仅能看冲突，
+> 还能直接看出新增了哪些记录、哪些状态变了、哪些金额或关键字段变了，
+> 以及这些变化会不会影响已确认/待确认/已撤销的数据。
+> 所有变更可导出为 JSON/CSV，程序重启后上下文不丢。
+
+```bash
+# ========= 前置准备：已有 v1 发票和收款，且做过匹配 =========
+# 导入发票 v1
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator zhangsan
+# 导入收款 v1
+python -m invoice_reconciler.cli.main import payments \
+    invoice_reconciler/data/sample_payments.csv --operator zhangsan
+# 自动匹配
+python -m invoice_reconciler.cli.main match --operator zhangsan
+
+# ========= 步骤 1：重新导入更新版发票文件（自动触发变更追踪） =========
+# 重新导入时会自动检测 4 类变更，并评估对匹配结果的影响
+#   - new_record: 新增记录（原批次没有）
+#   - status_change: 状态变更（如"正常"变"作废"）
+#   - amount_change: 金额变更
+#   - key_field_change: 关键字段变更（客户、日期等）
+#   - duplicate_process: 重复处理（不同操作者重新导入）
+# 影响类型：critical(严重) / affects_confirmed(影响已确认) /
+#          affects_pending(影响待确认) / affects_revoked(影响已撤销) /
+#          warning(警告) / none(无影响)
+python -m invoice_reconciler.cli.main import invoices \
+    invoice_reconciler/data/sample_invoices.csv --operator lisi
+
+# ========= 步骤 2：默认查看所有批次的变更（不带 batch_id） =========
+# 适合先全局看一遍所有变更，再决定深入哪个批次
+python -m invoice_reconciler.cli.main batch changes
+# 输出包含：变更统计表、影响分析表、处理状态表、变更明细（前20条）
+
+# ========= 步骤 3：按变更类型过滤筛查 =========
+# 只看金额变更
+python -m invoice_reconciler.cli.main batch changes --change-type amount_change
+# 只看状态变更
+python -m invoice_reconciler.cli.main batch changes --change-type status_change
+# 只看新增记录
+python -m invoice_reconciler.cli.main batch changes --change-type new_record
+
+# ========= 步骤 4：按影响程度过滤 =========
+# 只看严重影响的变更（可能影响已确认匹配）
+python -m invoice_reconciler.cli.main batch changes --impact-type critical
+# 只看影响已确认匹配的变更
+python -m invoice_reconciler.cli.main batch changes --impact-type affects_confirmed
+
+# ========= 步骤 5：缩小到具体批次查看 =========
+# 先看批次列表找批次ID
+python -m invoice_reconciler.cli.main batch list
+# 查看指定批次的所有变更
+python -m invoice_reconciler.cli.main batch changes --batch-id 2
+
+# ========= 步骤 6：按记录编号精准查找 =========
+python -m invoice_reconciler.cli.main batch changes --record-no INV005
+
+# ========= 步骤 7：更新变更处理状态（交接留痕） =========
+# 先看变更列表第一列的日志ID，比如 ID=3
+# 标记为已查看
+python -m invoice_reconciler.cli.main batch change-status 3 \
+    --status reviewed --operator lisi --remark "已核对，无影响"
+# 标记为已解决
+python -m invoice_reconciler.cli.main batch change-status 3 \
+    --status resolved --operator lisi --remark "已调整匹配，问题解决"
+# 标记为忽略
+python -m invoice_reconciler.cli.main batch change-status 3 \
+    --status ignored --operator lisi --remark "数据差异在可接受范围内，忽略"
+# 查看已处理的变更
+python -m invoice_reconciler.cli.main batch changes --status reviewed
+
+# ========= 步骤 8：导出变更日志（JSON 格式，适合程序处理） =========
+# 导出指定批次的所有变更日志，包含：
+#   - 变更前后摘要
+#   - 操作者、检测时间
+#   - 关联批次、处理状态
+#   - 影响分析详情
+python -m invoice_reconciler.cli.main batch export-changes 2 \
+    --operator lisi --format json
+
+# ========= 步骤 9：导出变更日志（CSV 格式，适合 Excel 打开） =========
+# 会生成两个文件：变更摘要.csv + 变更明细.csv
+python -m invoice_reconciler.cli.main batch export-changes 2 \
+    --operator lisi --format csv
+
+# ========= 步骤 10：模拟程序重启 - 恢复导出上下文 =========
+# 退出后重新运行，会自动显示上次导出和查看的批次
+# 使用 resume-export 一键用上次的上下文继续导出，不用重新记参数
+python -m invoice_reconciler.cli.main batch resume-export --operator lisi
+# 输出会显示：使用上次导出上下文（批次/类型/格式/上次导出时间）
+
+# ========= 步骤 11：模拟程序重启 - 恢复查看上下文 =========
+# 重新打开 batch changes 会自动恢复上次的查看范围和过滤条件
+# （上次是全部批次 / 指定批次 / 过滤了哪些类型）
+python -m invoice_reconciler.cli.main batch changes
+# 顶部会显示 [会话恢复] 上次查看变更: xxx
+```
+
+**变更日志导出字段说明（JSON / CSV 一致）：**
+
+| 字段 | 说明 |
+|------|------|
+| 日志ID | 变更日志唯一标识 |
+| 批次ID | 所属导入批次 |
+| 来源文件 | 原始文件名 |
+| 变更类型 | new_record / status_change / amount_change / key_field_change / duplicate_process |
+| 记录类型 | 发票 / 收款 |
+| 记录编号 | 发票号或收款号 |
+| 变更字段 | 发生变化的字段名（如 amount、status、customer） |
+| 原值 | 变更前的值 |
+| 新值 | 变更后的值 |
+| 变更摘要 | 中文变更说明 |
+| 变更前摘要 | 变更前记录完整摘要 |
+| 变更后摘要 | 变更后记录完整摘要 |
+| 影响类型 | critical / affects_confirmed / affects_pending / affects_revoked / warning / none |
+| 影响详情 | 影响分析的文字说明 |
+| 影响的匹配ID | 受影响的匹配记录ID列表 |
+| 处理状态 | pending / reviewed / resolved / ignored |
+| 操作者 | 触发本次导入的人 |
+| 检测时间 | 变更被检测到的时间 |
+| 处理时间 | 状态最后更新的时间 |
+| 处理人 | 最后更新状态的人 |
+| 备注 | 处理备注 |
+
 **导出内容说明：**
 - **批次摘要 Sheet**：批次信息、进度百分比、各状态计数（待确认/已确认/异常/已撤销）、冲突数
 - **匹配明细 Sheet**: 所有匹配记录（带处理人、状态、操作时间、匹配证据）
@@ -502,6 +632,21 @@ A: 回放校验可以对比当前数据状态与历史快照，检测是否有�
 
 ### Q: 什么是冲突检测？
 A: 冲突检测用于识别同一张发票被不同操作者重复处理的情况，防止重复核销。
+
+### Q: 变更追踪和冲突检测有什么区别？
+A: **冲突检测**是识别同一记录被重复处理、状态或金额不一致的问题列表；
+**变更追踪**是完整的变更日志，包括 5 类变更（新增记录/状态变更/金额变更/关键字段变更/重复处理）、
+影响分析（对已确认/待确认/已撤销数据的影响程度）、处理状态（待处理/已查看/已解决/已忽略），
+支持按类型过滤、导出为 JSON/CSV、程序重启后恢复上下文，更适合交接和追溯。
+
+### Q: 怎么看重新导入后有哪些变化？
+A: 使用 `batch changes` 命令：不带参数默认查看所有批次的全部变更，
+用 `--batch-id` 缩小到指定批次，用 `--change-type` 按类型过滤，
+用 `--impact-type` 按影响程度过滤。具体示例见"批次工作台 → 变更追踪"章节。
+
+### Q: 程序重启后导出会丢上下文吗？
+A: 不会。上次导出的批次、类型、格式都会持久化保存，用 `batch resume-export`
+可以一键继续导出，不用重新记参数。上次查看变更的范围和过滤条件也会恢复。
 
 ### Q: 程序重启后快照和历史会丢失吗？
 A: 不会。所有快照、状态历史和匹配数据都保存在 SQLite 数据库中，程序重启后可以继续操作。
