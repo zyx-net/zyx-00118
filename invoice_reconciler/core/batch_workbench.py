@@ -319,12 +319,17 @@ class BatchWorkbench:
 
         return session
 
-    def save_filters(self, operator: str = None, status: str = None) -> None:
+    def save_filters(self, operator: str = None, status: str = None,
+                     impact_filter: str = None, with_conflicts_only: bool = None) -> None:
         filters = {}
         if operator is not None:
             filters["operator"] = operator
         if status is not None:
             filters["status"] = status
+        if impact_filter is not None:
+            filters["impact_filter"] = impact_filter
+        if with_conflicts_only is not None:
+            filters["with_conflicts_only"] = with_conflicts_only
 
         if filters:
             self.db.set_session_state(SESSION_KEY_FILTER_OPERATOR, filters)
@@ -376,13 +381,15 @@ class BatchWorkbench:
 
     def save_export_context(self, batch_id: int, export_type: str,
                             format: str, operator: str = None,
-                            filters: Dict = None) -> None:
+                            filters: Dict = None,
+                            extra: Dict = None) -> None:
         context = {
             "batch_id": batch_id,
             "export_type": export_type,
             "format": format,
             "operator": operator,
             "filters": filters or {},
+            "extra": extra or {},
             "exported_at": datetime.now().isoformat(),
         }
         self.db.set_session_state(SESSION_KEY_LAST_EXPORT, context)

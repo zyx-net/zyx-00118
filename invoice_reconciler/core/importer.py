@@ -73,11 +73,30 @@ class CSVImporter:
         return self._import_file(file_path, "payment", operator)
 
     def _import_file(self, file_path: str, file_type: str, operator: str = None) -> Dict:
+        from .change_tracker import (
+            AUDIT_CATEGORY_IMPORT,
+            AUDIT_ACTION_IMPORT_START,
+            AUDIT_ACTION_IMPORT_COMPLETE,
+        )
+
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"文件不存在: {file_path}")
 
         existing_batch = self.db.check_file_imported(file_path, file_type)
         if existing_batch:
+            self.db.insert_audit_log(
+                action_type=AUDIT_ACTION_IMPORT_START,
+                action_category=AUDIT_CATEGORY_IMPORT,
+                action_summary=(
+                    f"{'发票' if file_type == 'invoice' else '收款'}文件"
+                    f" {os.path.basename(file_path)} 跳过重复导入"
+                    f"（已有批次 #{existing_batch['id']}）"
+                ),
+                batch_id=existing_batch["id"],
+                record_type=file_type,
+                operator=operator,
+                status="success",
+            )
             return {
                 "success": True,
                 "skipped": True,
@@ -113,6 +132,19 @@ class CSVImporter:
                 file_type, file_path, file_name, total_rows, operator
             )
 
+            self.db.insert_audit_log(
+                action_type=AUDIT_ACTION_IMPORT_START,
+                action_category=AUDIT_CATEGORY_IMPORT,
+                action_summary=(
+                    f"开始导入{'发票' if file_type == 'invoice' else '收款'}文件"
+                    f" {file_name}（{total_rows} 行）"
+                ),
+                batch_id=batch_id,
+                record_type=file_type,
+                operator=operator,
+                status="success",
+            )
+
             success_count = 0
             failed_count = 0
             conflict_count = 0
@@ -146,6 +178,30 @@ class CSVImporter:
             if change_result["total_changes"] > 0:
                 message += f"，追踪到 {change_result['total_changes']} 条变更记录"
 
+            complete_details = json.dumps({
+                "file_type": file_type,
+                "file_name": file_name,
+                "total_rows": total_rows,
+                "success_count": success_count,
+                "failed_count": failed_count,
+                "conflict_count": conflict_count,
+                "change_count": change_result["total_changes"],
+                "conflict_count_in_changes": change_result.get("conflict_count", 0),
+            }, ensure_ascii=False)
+
+            import_status = "failed" if failed_count == total_rows and success_count == 0 else "success"
+            self.db.insert_audit_log(
+                action_type=AUDIT_ACTION_IMPORT_COMPLETE,
+                action_category=AUDIT_CATEGORY_IMPORT,
+                action_summary=message,
+                batch_id=batch_id,
+                record_type=file_type,
+                operator=operator,
+                action_details=complete_details,
+                status=import_status,
+                error_message=None if import_status == "success" else "所有行导入失败",
+            )
+
             return {
                 "success": True,
                 "skipped": False,
@@ -159,6 +215,7 @@ class CSVImporter:
                 "changes_by_type": change_result["changes_by_type"],
                 "impact_summary": change_result["impact_summary"],
                 "change_log_ids": change_result["change_log_ids"],
+                "conflict_count_in_changes": change_result.get("conflict_count", 0),
                 "message": message
             }
 

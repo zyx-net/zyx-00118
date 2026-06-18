@@ -1,0 +1,2 @@
+invoice_no,invoice_date,customer,amount,status,remark
+BAD001,2024-01-15,,abc,normal,invalid amount and missing customer

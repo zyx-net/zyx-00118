@@ -1,0 +1,4 @@
+payment_no,payment_date,customer,amount,remark
+RPAY001,2024-01-10,Alpha Co,100.00,exact matched baseline
+RPAY002,2024-01-11,Beta Company,200.00,pending customer fuzzy
+RPAY003,2024-01-12,Gamma Co,300.00,to be revoked

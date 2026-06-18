@@ -1831,23 +1831,42 @@ def batch_clear_state(ctx):
               type=click.Choice(["pending", "reviewed", "resolved", "ignored"]),
               help="按处理状态过滤")
 @click.option("--record-no", default=None, help="按记录编号过滤")
+@click.option("--affect", "affect_filter", default=None,
+              type=click.Choice(["confirmed", "pending", "revoked", "all"]),
+              help="按影响的匹配状态过滤：已确认/待确认/已撤销/所有有影响的")
+@click.option("--timeline", is_flag=True, default=False,
+              help="按记录编号分组展示变更时间线视图")
+@click.option("--with-conflicts-only", is_flag=True, default=False,
+              help="只显示包含冲突原因的变更")
 @click.pass_context
-def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, record_no):
-    """查看批次变更日志明细"""
+def batch_changes(ctx, batch_id, change_type, impact_type, processing_status,
+                  record_no, affect_filter, timeline, with_conflicts_only):
+    """查看批次变更日志明细（支持影响筛选、时间线视图、冲突原因）"""
+    from invoice_reconciler.core.change_tracker import (
+        IMPACT_FILTER_CONFIRMED, IMPACT_FILTER_PENDING,
+        IMPACT_FILTER_REVOKED, IMPACT_FILTER_ALL_AFFECTED,
+    )
+
     tracker = ctx.obj["change_tracker"]
     db = ctx.obj["db"]
     workbench = ctx.obj["workbench"]
+    current_user = get_current_user()
 
     if batch_id:
-        workbench.save_last_selected_batch(batch_id, get_current_user())
+        workbench.save_last_selected_batch(batch_id, current_user)
 
     workbench.save_change_view_context(
         batch_id=batch_id,
         change_type=change_type,
         impact_type=impact_type,
         processing_status=processing_status,
-        operator=get_current_user(),
+        operator=current_user,
     )
+    if affect_filter:
+        workbench.save_filters(
+            impact_filter=affect_filter,
+            operator=current_user,
+        )
 
     logs = db.get_batch_change_logs(
         batch_id=batch_id,
@@ -1857,12 +1876,96 @@ def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, re
         record_no=record_no,
     )
 
+    if affect_filter:
+        filter_map = {
+            "confirmed": IMPACT_FILTER_CONFIRMED,
+            "pending": IMPACT_FILTER_PENDING,
+            "revoked": IMPACT_FILTER_REVOKED,
+            "all": IMPACT_FILTER_ALL_AFFECTED,
+        }
+        filtered_ids = [l["id"] for l in tracker.filter_changes_by_impact(
+            batch_id=batch_id, impact_filter=filter_map[affect_filter],
+            operator=current_user
+        )]
+        logs = [l for l in logs if l["id"] in filtered_ids]
+        filter_labels = {"confirmed": "影响已确认", "pending": "影响待确认",
+                         "revoked": "影响已撤销", "all": "影响所有匹配"}
+        click.echo(click.style(
+            f"🔍 已应用影响筛选：{filter_labels[affect_filter]}，命中 {len(logs)} 条",
+            fg="cyan"
+        ))
+
+    if with_conflicts_only:
+        logs = [l for l in logs if l.get("conflict_reason")]
+        click.echo(click.style(
+            f"🔍 只显示含冲突原因的变更：命中 {len(logs)} 条", fg="cyan"
+        ))
+
+    if timeline:
+        timeline_data = tracker.get_change_timeline(
+            batch_id=batch_id, operator=current_user
+        )
+        if affect_filter or with_conflicts_only:
+            valid_record_keys = set((l["record_type"], l["record_no"]) for l in logs)
+            timeline_data["records"] = [
+                r for r in timeline_data["records"]
+                if (r["record_type"], r["record_no"]) in valid_record_keys
+            ]
+            timeline_data["total_records"] = len(timeline_data["records"])
+
+        if not timeline_data["records"]:
+            click.echo(click.style("[OK] 未检测到变更记录", fg="green"))
+            return
+
+        click.echo(click.style(
+            f"📅 变更时间线：{timeline_data['total_records']} 条记录、"
+            f"{timeline_data['total_changes']} 次变更、"
+            f"{timeline_data['records_with_conflict']} 条含冲突",
+            fg="cyan", bold=True
+        ))
+        click.echo()
+        for idx, rec in enumerate(timeline_data["records"][:30]):
+            rt_label = "发票" if rec["record_type"] == "invoice" else "收款"
+            conflict_badge = click.style(" ⚠冲突", fg="red") if rec["has_conflict"] else ""
+            click.echo(click.style(
+                f"[{idx+1}] {rt_label} {rec['record_no']} "
+                f"（{rec['change_count']} 次变更）{conflict_badge}",
+                fg="blue", bold=True
+            ))
+            for ti, step in enumerate(rec["timeline"]):
+                step_prefix = "  └─" if ti == len(rec["timeline"]) - 1 else "  ├─"
+                conflict_note = ""
+                if step["conflict"]:
+                    conflict_note = click.style(
+                        f" [冲突: {step['conflict'][:40]}...]",
+                        fg="red"
+                    ) if len(step["conflict"]) > 40 else click.style(
+                        f" [冲突: {step['conflict']}]", fg="red"
+                    )
+                click.echo(
+                    f"{step_prefix} #{step['batch_id']} {step['change_type']}: "
+                    f"{step['summary'][:50]} | {step['detected_at']}"
+                    f" | 影响: {step['impact']}{conflict_note}"
+                )
+                if step["field"] != "-" and (step["old_value"] != "-" or step["new_value"] != "-"):
+                    click.echo(
+                        f"     字段 {step['field']}: {step['old_value']} → {step['new_value']}"
+                    )
+            click.echo()
+
+        total_timeline = len(timeline_data["records"])
+        if total_timeline > 30:
+            click.echo(f"... 还有 {total_timeline - 30} 条记录的时间线，建议导出查看")
+        return
+
     if not logs:
         click.echo(click.style("[OK] 未检测到变更记录", fg="green"))
         return
 
     summary = tracker.get_change_summary(batch_id=batch_id)
-    click.echo(click.style(f"📋 共 {len(logs)} 条变更记录", fg="cyan", bold=True))
+    conflict_count = sum(1 for l in logs if l.get("conflict_reason"))
+    click.echo(click.style(f"📋 共 {len(logs)} 条变更记录"
+                           f"（{conflict_count} 条含冲突原因）", fg="cyan", bold=True))
     click.echo()
     click.echo(click.style("=== 变更统计 ===", fg="cyan"))
     for ct, count in summary["by_type"].items():
@@ -1876,12 +1979,15 @@ def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, re
     click.echo(click.style("=== 处理状态 ===", fg="yellow"))
     for ps, count in summary["by_status"].items():
         click.echo(f"  {PROCESSING_STATUS_LABELS.get(ps, ps)}: {count}")
+    if conflict_count > 0:
+        click.echo(click.style(f"=== 冲突记录: {conflict_count} 条 ===", fg="red"))
     click.echo()
 
     headers = ["ID", "批次", "变更类型", "记录类型", "记录编号",
-               "影响类型", "处理状态", "变更摘要", "检测时间"]
+               "影响类型", "处理状态", "冲突?", "变更摘要", "检测时间"]
     rows = []
-    for log in logs:
+    for log in logs[:20]:
+        conflict_flag = click.style("⚠", fg="red") if log.get("conflict_reason") else "-"
         rows.append([
             log["id"],
             log["batch_id"],
@@ -1891,10 +1997,25 @@ def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, re
             IMPACT_TYPE_LABELS.get(log["impact_type"] or "none", log["impact_type"] or "none"),
             PROCESSING_STATUS_LABELS.get(log["processing_status"] or "pending",
                                         log["processing_status"] or "pending"),
+            conflict_flag,
             (log["change_summary"] or "")[:40],
             log["detected_at"],
         ])
-    print_table(headers, rows[:20])
+    print_table(headers, rows)
+
+    conflict_logs = [l for l in logs[:20] if l.get("conflict_reason")]
+    if conflict_logs:
+        click.echo()
+        click.echo(click.style("⚠ 以下变更包含冲突原因：", fg="red", bold=True))
+        for clog in conflict_logs[:10]:
+            click.echo(click.style(
+                f"  • 日志 #{clog['id']} 批次 #{clog['batch_id']} "
+                f"{'发票' if clog['record_type'] == 'invoice' else '收款'} {clog['record_no']}:",
+                fg="red"
+            ))
+            for line in clog["conflict_reason"].split(" | "):
+                click.echo(f"      - {line}")
+
     if len(logs) > 20:
         click.echo(f"\n... 还有 {len(logs) - 20} 条，使用 `batch export-changes` 导出完整明细")
 
@@ -1905,6 +2026,11 @@ def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, re
     click.echo("  • 金额变更: 同一记录在不同批次中的金额不一致")
     click.echo("  • 关键字段变更: 客户、日期等关键字段发生变化")
     click.echo("  • 重复处理: 同一记录被不同操作者处理")
+    click.echo()
+    click.echo(click.style("冲突类型说明:", fg="red"))
+    click.echo("  • 连续更新: 同记录在多个批次中连续发生同字段变更")
+    click.echo("  • 撤销后重导入: 已撤销的匹配关联记录重新导入")
+    click.echo("  • 同字段并发修改: 不同批次/文件同时改到同一关键字段")
 
 
 @batch.command("export-changes")
@@ -1912,23 +2038,98 @@ def batch_changes(ctx, batch_id, change_type, impact_type, processing_status, re
 @click.option("--operator", default=None, help="当前操作者")
 @click.option("--format", "export_format", type=click.Choice(["json", "csv"]),
               default="json", help="导出格式，默认JSON")
+@click.option("--affect", "affect_filter", default=None,
+              type=click.Choice(["confirmed", "pending", "revoked", "all"]),
+              help="按影响的匹配状态过滤导出：已确认/待确认/已撤销/所有有影响的")
+@click.option("--with-conflicts-only", is_flag=True, default=False,
+              help="只导出包含冲突原因的变更")
 @click.pass_context
-def batch_export_changes(ctx, batch_id, operator, export_format):
-    """导出批次变更日志（JSON或CSV格式）"""
+def batch_export_changes(ctx, batch_id, operator, export_format,
+                         affect_filter, with_conflicts_only):
+    """导出批次变更日志（JSON或CSV格式，内容与batch changes命令一致）"""
+    from invoice_reconciler.core.change_tracker import (
+        IMPACT_FILTER_CONFIRMED, IMPACT_FILTER_PENDING,
+        IMPACT_FILTER_REVOKED, IMPACT_FILTER_ALL_AFFECTED,
+    )
+
     tracker = ctx.obj["change_tracker"]
     workbench = ctx.obj["workbench"]
     operator = operator or get_current_user()
 
     workbench.save_last_selected_batch(batch_id, operator)
+
+    log_ids = None
+    extra_meta = {"filter_note": "未应用筛选，导出全量变更"}
+
+    if affect_filter or with_conflicts_only:
+        all_logs = tracker.filter_changes_by_impact(
+            batch_id=batch_id,
+            impact_filter=IMPACT_FILTER_ALL_AFFECTED,
+            operator=operator,
+        )
+        all_log_ids = set(l["id"] for l in all_logs)
+
+        filter_parts = []
+        if affect_filter:
+            filter_map = {
+                "confirmed": IMPACT_FILTER_CONFIRMED,
+                "pending": IMPACT_FILTER_PENDING,
+                "revoked": IMPACT_FILTER_REVOKED,
+                "all": IMPACT_FILTER_ALL_AFFECTED,
+            }
+            filtered = tracker.filter_changes_by_impact(
+                batch_id=batch_id,
+                impact_filter=filter_map[affect_filter],
+                operator=operator,
+            )
+            all_log_ids &= set(l["id"] for l in filtered)
+            filter_labels = {"confirmed": "影响已确认匹配",
+                             "pending": "影响待确认匹配",
+                             "revoked": "影响已撤销匹配",
+                             "all": "所有有影响的匹配"}
+            filter_parts.append(filter_labels[affect_filter])
+            extra_meta["affect_filter"] = affect_filter
+
+        if with_conflicts_only:
+            db = ctx.obj["db"]
+            all_batch_logs = db.get_batch_change_logs(batch_id=batch_id)
+            conflict_ids = set(l["id"] for l in all_batch_logs if l.get("conflict_reason"))
+            all_log_ids &= conflict_ids
+            filter_parts.append("仅含冲突原因")
+            extra_meta["with_conflicts_only"] = True
+
+        log_ids = sorted(all_log_ids)
+        extra_meta["filter_note"] = "、".join(filter_parts) if filter_parts else "全量"
+
     workbench.save_export_context(
         batch_id=batch_id,
         export_type="change_logs",
         format=export_format,
         operator=operator,
+        extra={
+            "affect_filter": affect_filter,
+            "with_conflicts_only": with_conflicts_only,
+            "log_ids": log_ids,
+            "extra_meta": extra_meta,
+        },
     )
 
-    click.echo(f"正在导出批次 #{batch_id} 变更日志...")
-    result = tracker.export_change_logs(batch_id, operator, format=export_format)
+    extra_meta.update({
+        "export_note": ("导出内容与 `batch changes` 命令筛选条件一致，"
+                        "包含变更前后摘要、导入来源、操作者、时间、关联批次、处理状态、冲突原因"),
+        "cli_command_tip": (
+            f"可执行: reconciler batch changes --batch-id {batch_id}"
+            + (f" --affect {affect_filter}" if affect_filter else "")
+            + (" --with-conflicts-only" if with_conflicts_only else "")
+            + " 查看 CLI 输出"
+        ),
+    })
+
+    click.echo(f"正在导出批次 #{batch_id} 变更日志（{extra_meta['filter_note']}）...")
+    result = tracker.export_change_logs(
+        batch_id, operator, format=export_format,
+        log_ids=log_ids, extra_meta=extra_meta
+    )
 
     if not result["success"]:
         click.echo(click.style(f"[!!] {result['message']}", fg="red"), err=True)
@@ -2001,8 +2202,21 @@ def batch_resume_export(ctx, operator):
     click.echo()
 
     if export_type == "change_logs":
-        click.echo(f"正在导出批次 #{batch_id} 变更日志...")
-        result = tracker.export_change_logs(batch_id, operator, format=export_format)
+        extra_context = last_context.get("extra", {})
+        log_ids = extra_context.get("log_ids")
+        extra_meta = extra_context.get("extra_meta") or {}
+        if log_ids:
+            extra_meta.setdefault("filter_note", "恢复重启前的筛选条件")
+            extra_meta.setdefault("restored_from", last_context.get("exported_at", "-"))
+        filter_msg = (
+            f"（{extra_meta.get('filter_note', '全量')}"
+            f"，{len(log_ids) if log_ids else '全部'} 条）"
+        )
+        click.echo(f"正在导出批次 #{batch_id} 变更日志{filter_msg}...")
+        result = tracker.export_change_logs(
+            batch_id, operator, format=export_format,
+            log_ids=log_ids, extra_meta=extra_meta
+        )
     elif export_type == "batch_progress":
         exporter = ctx.obj["exporter"]
         click.echo(f"正在导出批次 #{batch_id} 进度...")

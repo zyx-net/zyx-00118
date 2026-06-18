@@ -328,6 +328,7 @@ class Database:
                     processed_at DATETIME,
                     processed_by TEXT,
                     remark TEXT,
+                    conflict_reason TEXT,
                     FOREIGN KEY (batch_id) REFERENCES import_batches(id)
                 );
 
@@ -336,6 +337,28 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_change_logs_record ON batch_change_logs(record_no);
                 CREATE INDEX IF NOT EXISTS idx_change_logs_impact ON batch_change_logs(impact_type);
                 CREATE INDEX IF NOT EXISTS idx_change_logs_status ON batch_change_logs(processing_status);
+
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action_type TEXT NOT NULL,
+                    action_category TEXT NOT NULL,
+                    batch_id INTEGER,
+                    record_type TEXT,
+                    record_no TEXT,
+                    operator TEXT,
+                    action_summary TEXT NOT NULL,
+                    action_details TEXT,
+                    status TEXT DEFAULT 'success',
+                    error_message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (batch_id) REFERENCES import_batches(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action_type);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_batch ON audit_logs(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_operator ON audit_logs(operator);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_category ON audit_logs(action_category);
+                CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs(created_at);
             """)
 
     @staticmethod
@@ -1794,4 +1817,163 @@ class Database:
             sql += " ORDER BY m.created_at DESC"
 
             rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def insert_audit_log(self, action_type: str, action_category: str,
+                         action_summary: str, batch_id: int = None,
+                         record_type: str = None, record_no: str = None,
+                         operator: str = None, action_details: str = None,
+                         status: str = 'success', error_message: str = None) -> int:
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO audit_logs
+                   (action_type, action_category, action_summary, batch_id,
+                    record_type, record_no, operator, action_details,
+                    status, error_message)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (action_type, action_category, action_summary, batch_id,
+                 record_type, record_no, operator, action_details,
+                 status, error_message)
+            )
+            return cursor.lastrowid
+
+    def get_audit_logs(self, batch_id: int = None, action_category: str = None,
+                       action_type: str = None, operator: str = None,
+                       limit: int = 200) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = "SELECT * FROM audit_logs WHERE 1=1"
+            params = []
+            if batch_id:
+                sql += " AND batch_id = ?"
+                params.append(batch_id)
+            if action_category:
+                sql += " AND action_category = ?"
+                params.append(action_category)
+            if action_type:
+                sql += " AND action_type = ?"
+                params.append(action_type)
+            if operator:
+                sql += " AND operator = ?"
+                params.append(operator)
+            sql += " ORDER BY created_at DESC LIMIT ?"
+            params.append(limit)
+
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [dict(r) for r in rows]
+
+    def insert_batch_change_log(self, batch_id: int, change_type: str, record_type: str,
+                                record_no: str, change_summary: str,
+                                field_name: str = None, old_value: str = None,
+                                new_value: str = None, before_summary: str = None,
+                                after_summary: str = None, impact_type: str = None,
+                                impact_details: str = None, impacted_match_ids: List[int] = None,
+                                operator: str = None, processing_status: str = 'pending',
+                                remark: str = None, conflict_reason: str = None) -> int:
+        import json
+        impacted_ids_str = json.dumps(impacted_match_ids) if impacted_match_ids else None
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                """INSERT INTO batch_change_logs
+                   (batch_id, change_type, record_type, record_no, field_name,
+                    old_value, new_value, change_summary, before_summary, after_summary,
+                    impact_type, impact_details, impacted_match_ids, operator,
+                    processing_status, remark, conflict_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (batch_id, change_type, record_type, record_no, field_name,
+                 old_value, new_value, change_summary, before_summary, after_summary,
+                 impact_type, impact_details, impacted_ids_str, operator,
+                 processing_status, remark, conflict_reason)
+            )
+            return cursor.lastrowid
+
+    def get_record_change_history(self, record_type: str, record_no: str) -> List[Dict]:
+        import json
+        with self._get_conn() as conn:
+            sql = """SELECT cl.*, b.file_name, b.file_type, b.imported_at as batch_imported_at
+                     FROM batch_change_logs cl
+                     JOIN import_batches b ON cl.batch_id = b.id
+                     WHERE cl.record_type = ? AND cl.record_no = ?
+                     ORDER BY cl.detected_at ASC"""
+            rows = conn.execute(sql, (record_type, record_no)).fetchall()
+
+            result = []
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict.get("impacted_match_ids"):
+                    try:
+                        row_dict["impacted_match_ids"] = json.loads(row_dict["impacted_match_ids"])
+                    except (json.JSONDecodeError, TypeError):
+                        row_dict["impacted_match_ids"] = []
+                result.append(row_dict)
+            return result
+
+    def get_record_revoked_status(self, record_type: str, record_no: str) -> Dict:
+        result = {
+            "has_been_revoked": False,
+            "revoked_matches": [],
+            "reimported_after_revoke": False,
+        }
+        with self._get_conn() as conn:
+            if record_type == "invoice":
+                match_rows = conn.execute(
+                    """SELECT m.*, i.invoice_no as rec_no
+                       FROM matches m
+                       JOIN invoices i ON m.invoice_id = i.id
+                       WHERE i.invoice_no = ? AND m.status = 'revoked'
+                       ORDER BY m.confirmed_at DESC""",
+                    (record_no,)
+                ).fetchall()
+            else:
+                match_rows = conn.execute(
+                    """SELECT m.*, p.payment_no as rec_no
+                       FROM matches m
+                       JOIN payments p ON m.payment_id = p.id
+                       WHERE p.payment_no = ? AND m.status = 'revoked'
+                       ORDER BY m.confirmed_at DESC""",
+                    (record_no,)
+                ).fetchall()
+
+            if match_rows:
+                result["has_been_revoked"] = True
+                result["revoked_matches"] = [dict(r) for r in match_rows]
+
+                last_revoked_at = None
+                for r in result["revoked_matches"]:
+                    if r.get("confirmed_at"):
+                        if last_revoked_at is None or r["confirmed_at"] > last_revoked_at:
+                            last_revoked_at = r["confirmed_at"]
+
+                if last_revoked_at and result["revoked_matches"]:
+                    if record_type == "invoice":
+                        change_rows = conn.execute(
+                            """SELECT detected_at FROM batch_change_logs cl
+                               JOIN invoices i ON 1=1
+                               WHERE cl.record_no = ? AND cl.record_type = 'invoice'
+                                 AND cl.detected_at > ?
+                               LIMIT 1""",
+                            (record_no, last_revoked_at)
+                        ).fetchall()
+                    else:
+                        change_rows = conn.execute(
+                            """SELECT detected_at FROM batch_change_logs cl
+                               WHERE cl.record_no = ? AND cl.record_type = 'payment'
+                                 AND cl.detected_at > ?
+                               LIMIT 1""",
+                            (record_no, last_revoked_at)
+                        ).fetchall()
+                    if change_rows:
+                        result["reimported_after_revoke"] = True
+
+        return result
+
+    def get_concurrent_field_conflicts(self, batch_id: int, record_type: str,
+                                       record_no: str, field_name: str) -> List[Dict]:
+        with self._get_conn() as conn:
+            sql = """SELECT cl.*, b.file_name, b.operator as batch_operator
+                     FROM batch_change_logs cl
+                     JOIN import_batches b ON cl.batch_id = b.id
+                     WHERE cl.record_type = ? AND cl.record_no = ?
+                       AND cl.field_name = ? AND cl.batch_id <= ?
+                     ORDER BY cl.detected_at ASC"""
+            rows = conn.execute(sql, (record_type, record_no, field_name, batch_id)).fetchall()
             return [dict(r) for r in rows]

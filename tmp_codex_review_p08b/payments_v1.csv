@@ -1,0 +1,4 @@
+﻿payment_no,payment_date,customer,amount
+SPAY001,2024-01-10,Alpha Co,100.00
+SPAY002,2024-01-11,Beta Company,200.00
+SPAY003,2024-01-12,Gamma Co,300.00

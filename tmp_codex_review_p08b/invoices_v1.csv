@@ -1,0 +1,4 @@
+﻿invoice_no,invoice_date,customer,amount,status
+SINV001,2024-01-10,Alpha Co,100.00,正常
+SINV002,2024-01-11,Beta Co,200.00,正常
+SINV003,2024-01-12,Gamma Co,300.00,正常

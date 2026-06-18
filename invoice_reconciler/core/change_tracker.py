@@ -58,6 +58,27 @@ PROCESSING_STATUS_LABELS = {
 KEY_FIELDS_INVOICE = ["customer", "invoice_date"]
 KEY_FIELDS_PAYMENT = ["customer", "payment_date"]
 
+CONFLICT_REASON_CONSECUTIVE_UPDATE = "consecutive_update"
+CONFLICT_REASON_REVOKED_REIMPORT = "revoked_reimport"
+CONFLICT_REASON_CONCURRENT_FIELD_CHANGE = "concurrent_field_change"
+
+AUDIT_CATEGORY_IMPORT = "import"
+AUDIT_CATEGORY_CONFLICT = "conflict_detect"
+AUDIT_CATEGORY_EXPORT = "export"
+AUDIT_CATEGORY_CHANGE_VIEW = "change_view"
+
+AUDIT_ACTION_IMPORT_START = "import_start"
+AUDIT_ACTION_IMPORT_COMPLETE = "import_complete"
+AUDIT_ACTION_CONFLICT_DETECTED = "conflict_detected"
+AUDIT_ACTION_EXPORT_START = "export_start"
+AUDIT_ACTION_EXPORT_COMPLETE = "export_complete"
+AUDIT_ACTION_CHANGE_VIEWED = "change_viewed"
+
+IMPACT_FILTER_CONFIRMED = "confirmed"
+IMPACT_FILTER_PENDING = "pending"
+IMPACT_FILTER_REVOKED = "revoked"
+IMPACT_FILTER_ALL_AFFECTED = "all_affected"
+
 
 class ChangeTracker:
     def __init__(self, config: Config, db: Database):
@@ -199,6 +220,62 @@ class ChangeTracker:
                 f"匹配状态: {record.get('match_status', '-')}"
             )
 
+    def _detect_conflict_reasons(self, batch_id: int, record_type: str,
+                                record_no: str, change_type: str,
+                                field_name: str = None,
+                                old_value: Any = None,
+                                new_value: Any = None) -> str:
+        reasons = []
+        history = self.db.get_record_change_history(record_type, record_no)
+        relevant_history = [h for h in history if h["batch_id"] < batch_id]
+
+        if len(relevant_history) >= 1 and change_type != CHANGE_TYPE_NEW_RECORD:
+            prior_changes = [h for h in relevant_history
+                          if h["change_type"] == change_type
+                          and (field_name is None or h.get("field_name") == field_name)]
+            if len(prior_changes) >= 1:
+                prev = prior_changes[-1]
+                prev_batch = prev.get("batch_id")
+                reasons.append(
+                    f"连续更新：该记录在批次 #{prev_batch} 已发生过同类型变更"
+                    f"（{prev.get("old_value", "-")} → {prev.get("new_value", "-")}），"
+                    f"本次批次 #{batch_id} 再次变更，"
+                    f"需确认是否为有意连续修正"
+                )
+
+        revoked_status = self.db.get_record_revoked_status(record_type, record_no)
+        if revoked_status["has_been_revoked"] and revoked_status["reimported_after_revoke"]:
+            revoked_matches = revoked_status["revoked_matches"]
+            if revoked_matches:
+                rm = revoked_matches[0]
+                reasons.append(
+                    f"撤销后重导入：相关匹配 {rm.get("match_no", "-")} "
+                    f"（状态已撤销，本次导入后重新生效，"
+                    f"需确认是否需要重新核对"
+                )
+
+        if field_name and change_type in [CHANGE_TYPE_STATUS_CHANGE,
+                                       CHANGE_TYPE_AMOUNT_CHANGE,
+                                       CHANGE_TYPE_KEY_FIELD_CHANGE]:
+            concurrent = self.db.get_concurrent_field_conflicts(
+                batch_id, record_type, record_no, field_name
+            )
+            concurrent_batches = [c for c in concurrent
+                            if c["batch_id"] < batch_id]
+            if len(concurrent_batches) >= 1:
+                cb = concurrent_batches[-1]
+                reasons.append(
+                    f"同字段并发修改：字段 {field_name} 在批次 #{cb["batch_id"]} "
+                    f"（文件 {cb.get("file_name", "-")} 中已由 "
+                    f"{cb.get("batch_operator", "未知操作者")} 修改为 "
+                    f"{cb.get("new_value", "-")}，"
+                    f"本次批次 #{batch_id} 又改为 {new_value}，存在冲突"
+                )
+
+        if not reasons:
+            return None
+        return " | ".join(reasons)
+
     def track_new_record(self, batch_id: int, record_type: str,
                          record_no: str, new_record: Dict,
                          operator: str = None) -> int:
@@ -208,6 +285,10 @@ class ChangeTracker:
         after_summary = self._format_summary(new_record, record_type)
         impact_type, impact_details, impacted_ids = self._analyze_impact(
             record_type, record_no, CHANGE_TYPE_NEW_RECORD
+        )
+
+        conflict_reason = self._detect_conflict_reasons(
+            batch_id, record_type, record_no, CHANGE_TYPE_NEW_RECORD
         )
 
         return self.db.insert_batch_change_log(
@@ -223,6 +304,7 @@ class ChangeTracker:
             impacted_match_ids=impacted_ids,
             operator=operator,
             processing_status=PROCESSING_STATUS_PENDING,
+            conflict_reason=conflict_reason,
         )
 
     def track_status_change(self, batch_id: int, record_type: str,
@@ -237,6 +319,11 @@ class ChangeTracker:
         after_summary = self._format_summary(new_record, record_type)
         impact_type, impact_details, impacted_ids = self._analyze_impact(
             record_type, record_no, CHANGE_TYPE_STATUS_CHANGE,
+            field_name="status", old_value=old_status, new_value=new_status
+        )
+
+        conflict_reason = self._detect_conflict_reasons(
+            batch_id, record_type, record_no, CHANGE_TYPE_STATUS_CHANGE,
             field_name="status", old_value=old_status, new_value=new_status
         )
 
@@ -256,6 +343,7 @@ class ChangeTracker:
             impacted_match_ids=impacted_ids,
             operator=operator,
             processing_status=PROCESSING_STATUS_PENDING,
+            conflict_reason=conflict_reason,
         )
 
     def track_amount_change(self, batch_id: int, record_type: str,
@@ -270,6 +358,11 @@ class ChangeTracker:
         after_summary = self._format_summary(new_record, record_type)
         impact_type, impact_details, impacted_ids = self._analyze_impact(
             record_type, record_no, CHANGE_TYPE_AMOUNT_CHANGE,
+            field_name="amount", old_value=old_amount, new_value=new_amount
+        )
+
+        conflict_reason = self._detect_conflict_reasons(
+            batch_id, record_type, record_no, CHANGE_TYPE_AMOUNT_CHANGE,
             field_name="amount", old_value=old_amount, new_value=new_amount
         )
 
@@ -289,6 +382,7 @@ class ChangeTracker:
             impacted_match_ids=impacted_ids,
             operator=operator,
             processing_status=PROCESSING_STATUS_PENDING,
+            conflict_reason=conflict_reason,
         )
 
     def track_key_field_change(self, batch_id: int, record_type: str,
@@ -308,6 +402,11 @@ class ChangeTracker:
             field_name=field_name, old_value=old_value, new_value=new_value
         )
 
+        conflict_reason = self._detect_conflict_reasons(
+            batch_id, record_type, record_no, CHANGE_TYPE_KEY_FIELD_CHANGE,
+            field_name=field_name, old_value=old_value, new_value=new_value
+        )
+
         return self.db.insert_batch_change_log(
             batch_id=batch_id,
             change_type=CHANGE_TYPE_KEY_FIELD_CHANGE,
@@ -324,6 +423,7 @@ class ChangeTracker:
             impacted_match_ids=impacted_ids,
             operator=operator,
             processing_status=PROCESSING_STATUS_PENDING,
+            conflict_reason=conflict_reason,
         )
 
     def track_duplicate_process(self, batch_id: int, record_type: str,
@@ -338,6 +438,10 @@ class ChangeTracker:
         after_summary = self._format_summary(new_record, record_type)
         impact_type, impact_details, impacted_ids = self._analyze_impact(
             record_type, record_no, CHANGE_TYPE_DUPLICATE_PROCESS
+        )
+
+        conflict_reason = self._detect_conflict_reasons(
+            batch_id, record_type, record_no, CHANGE_TYPE_DUPLICATE_PROCESS
         )
 
         return self.db.insert_batch_change_log(
@@ -356,6 +460,7 @@ class ChangeTracker:
             impacted_match_ids=impacted_ids,
             operator=operator,
             processing_status=PROCESSING_STATUS_PENDING,
+            conflict_reason=conflict_reason,
         )
 
     def detect_and_track_changes(self, batch_id: int, file_type: str,
@@ -468,12 +573,37 @@ class ChangeTracker:
             if log["impact_type"] in impact_summary:
                 impact_summary[log["impact_type"]] += 1
 
+        conflict_count = sum(1 for l in all_logs if l.get("conflict_reason"))
+
+        audit_details = json.dumps({
+            "file_type": file_type,
+            "change_count": len(change_log_ids),
+            "changes_by_type": changes_by_type,
+            "impact_summary": impact_summary,
+            "conflict_count": conflict_count,
+        }, ensure_ascii=False)
+
+        self.db.insert_audit_log(
+            action_type=AUDIT_ACTION_CONFLICT_DETECTED,
+            action_category=AUDIT_CATEGORY_CONFLICT,
+            action_summary=(
+                f"批次 #{batch_id} 导入检测：{len(change_log_ids)} 条变更，"
+                f"{conflict_count} 条含冲突原因"
+            ),
+            batch_id=batch_id,
+            record_type=file_type,
+            operator=operator,
+            action_details=audit_details,
+            status="success",
+        )
+
         return {
             "success": True,
             "total_changes": len(change_log_ids),
             "changes_by_type": changes_by_type,
             "impact_summary": impact_summary,
             "change_log_ids": change_log_ids,
+            "conflict_count": conflict_count,
         }
 
     def get_change_summary(self, batch_id: int = None) -> Dict:
@@ -503,27 +633,58 @@ class ChangeTracker:
         }
 
     def export_change_logs(self, batch_id: int, operator: str = None,
-                           format: str = "json") -> Dict:
+                           format: str = "json", log_ids: List[int] = None,
+                           extra_meta: Dict = None) -> Dict:
         logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        if log_ids:
+            id_set = set(log_ids)
+            logs = [l for l in logs if l["id"] in id_set]
+            logs.sort(key=lambda x: log_ids.index(x["id"]) if x["id"] in log_ids else 9999)
         batch_info = self.db.get_batch(batch_id)
 
         if not batch_info:
+            self.db.insert_audit_log(
+                action_type=AUDIT_ACTION_EXPORT_START,
+                action_category=AUDIT_CATEGORY_EXPORT,
+                action_summary=f"批次 #{batch_id} 变更日志导出失败：批次不存在",
+                batch_id=batch_id,
+                operator=operator,
+                status="failed",
+                error_message="批次不存在",
+            )
             return {"success": False, "message": "批次不存在"}
+
+        export_op = operator or get_current_user()
+
+        self.db.insert_audit_log(
+            action_type=AUDIT_ACTION_EXPORT_START,
+            action_category=AUDIT_CATEGORY_EXPORT,
+            action_summary=(
+                f"开始导出批次 #{batch_id} 变更日志"
+                f"（{len(logs)} 条记录，格式: {format}）"
+            ),
+            batch_id=batch_id,
+            operator=export_op,
+            status="success",
+        )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_type_label = "发票" if batch_info["file_type"] == "invoice" else "收款"
 
+        export_info = {
+            "exported_at": datetime.now().isoformat(),
+            "exported_by": operator or get_current_user(),
+            "batch_id": batch_id,
+            "file_name": batch_info["file_name"],
+            "file_type": file_type_label,
+            "imported_at": batch_info["imported_at"],
+            "imported_by": batch_info.get("operator", "-"),
+            "total_changes": len(logs),
+        }
+        if extra_meta:
+            export_info.update(extra_meta)
         export_data = {
-            "export_info": {
-                "exported_at": datetime.now().isoformat(),
-                "exported_by": operator or get_current_user(),
-                "batch_id": batch_id,
-                "file_name": batch_info["file_name"],
-                "file_type": file_type_label,
-                "imported_at": batch_info["imported_at"],
-                "imported_by": batch_info.get("operator", "-"),
-                "total_changes": len(logs),
-            },
+            "export_info": export_info,
             "summary": {
                 "by_type": {},
                 "by_impact": {},
@@ -539,6 +700,9 @@ class ChangeTracker:
             export_data["summary"]["by_impact"][it] = export_data["summary"]["by_impact"].get(it, 0) + 1
             ps = log["processing_status"] or PROCESSING_STATUS_PENDING
             export_data["summary"]["by_status"][ps] = export_data["summary"]["by_status"].get(ps, 0) + 1
+
+            conflict_reason_val = log.get("conflict_reason") or "-"
+            has_conflict = "是" if log.get("conflict_reason") else "否"
 
             log_entry = {
                 "日志ID": log["id"],
@@ -557,6 +721,8 @@ class ChangeTracker:
                                                   log["impact_type"] or IMPACT_TYPE_NONE),
                 "影响详情": log.get("impact_details") or "-",
                 "影响的匹配ID": ", ".join(map(str, log.get("impacted_match_ids") or [])) or "-",
+                "是否有冲突": has_conflict,
+                "冲突原因": conflict_reason_val,
                 "处理状态": PROCESSING_STATUS_LABELS.get(
                     log["processing_status"] or PROCESSING_STATUS_PENDING,
                     log["processing_status"] or PROCESSING_STATUS_PENDING
@@ -572,12 +738,14 @@ class ChangeTracker:
         base_name = f"change_log_batch_{batch_id}_{timestamp}"
         os.makedirs(self.config.export_dir, exist_ok=True)
 
+        result = None
+
         if format == "json":
             file_path = os.path.join(self.config.export_dir, f"{base_name}.json")
             with open(file_path, "w", encoding="utf-8") as f:
                 json.dump(export_data, f, ensure_ascii=False, indent=2)
 
-            return {
+            result = {
                 "success": True,
                 "file_path": file_path,
                 "format": "json",
@@ -623,7 +791,7 @@ class ChangeTracker:
                     writer.writeheader()
                     writer.writerows(export_data["change_logs"])
 
-            return {
+            result = {
                 "success": True,
                 "file_path": dir_path,
                 "format": "csv",
@@ -634,7 +802,141 @@ class ChangeTracker:
             }
 
         else:
-            return {"success": False, "message": f"不支持的导出格式: {format}"}
+            result = {"success": False, "message": f"不支持的导出格式: {format}"}
+
+        if result["success"]:
+            audit_details = json.dumps(result, ensure_ascii=False, default=str)
+            self.db.insert_audit_log(
+                action_type=AUDIT_ACTION_EXPORT_COMPLETE,
+                action_category=AUDIT_CATEGORY_EXPORT,
+                action_summary=(
+                    f"批次 #{batch_id} 变更日志导出成功"
+                    f"（{len(logs)} 条，{format}）"
+                ),
+                batch_id=batch_id,
+                operator=export_op,
+                action_details=audit_details,
+                status="success",
+            )
+        else:
+            self.db.insert_audit_log(
+                action_type=AUDIT_ACTION_EXPORT_COMPLETE,
+                action_category=AUDIT_CATEGORY_EXPORT,
+                action_summary=f"批次 #{batch_id} 变更日志导出失败",
+                batch_id=batch_id,
+                operator=export_op,
+                status="failed",
+                error_message=result.get("message"),
+            )
+
+        return result
+
+    def get_change_timeline(self, batch_id: int = None,
+                           record_type: str = None,
+                           operator: str = None) -> Dict:
+        if batch_id:
+            logs = self.db.get_batch_change_logs(batch_id=batch_id)
+        else:
+            logs = self.db.get_batch_change_logs()
+            if record_type:
+                logs = [l for l in logs if l["record_type"] == record_type]
+
+        by_record = {}
+        for log in logs:
+            key = (log["record_type"], log["record_no"])
+            if key not in by_record:
+                by_record[key] = {
+                    "record_type": key[0],
+                    "record_no": key[1],
+                    "change_count": 0,
+                    "has_conflict": False,
+                    "timeline": [],
+                }
+            entry = by_record[key]
+            entry["change_count"] += 1
+            if log.get("conflict_reason"):
+                entry["has_conflict"] = True
+            timeline_item = {
+                "log_id": log["id"],
+                "batch_id": log["batch_id"],
+                "file_name": log.get("file_name", "-"),
+                "change_type": CHANGE_TYPE_LABELS.get(
+                    log["change_type"], log["change_type"]
+                ),
+                "field": log.get("field_name") or "-",
+                "old_value": log.get("old_value") or "-",
+                "new_value": log.get("new_value") or "-",
+                "summary": log["change_summary"],
+                "before": log.get("before_summary") or "-",
+                "after": log.get("after_summary") or "-",
+                "impact": IMPACT_TYPE_LABELS.get(
+                    log["impact_type"] or IMPACT_TYPE_NONE,
+                    log["impact_type"] or IMPACT_TYPE_NONE
+                ),
+                "conflict": log.get("conflict_reason") or None,
+                "operator": log.get("operator") or "-",
+                "detected_at": log["detected_at"],
+            }
+            entry["timeline"].append(timeline_item)
+
+        for key in by_record:
+            by_record[key]["timeline"].sort(key=lambda x: x["detected_at"])
+
+        self.db.insert_audit_log(
+            action_type=AUDIT_ACTION_CHANGE_VIEWED,
+            action_category=AUDIT_CATEGORY_CHANGE_VIEW,
+            action_summary=(
+                f"查看{('批次 #' + str(batch_id)) if batch_id else '全部'} "
+                f"变更时间线：{len(by_record)} 条记录、"
+                f"{len(logs)} 条变更"
+            ),
+            batch_id=batch_id,
+            operator=operator,
+            action_details=json.dumps({
+                "record_count": len(by_record),
+                "change_count": len(logs),
+                "conflict_records": sum(1 for r in by_record.values() if r["has_conflict"]),
+            }, ensure_ascii=False),
+            status="success",
+        )
+
+        return {
+            "total_records": len(by_record),
+            "total_changes": len(logs),
+            "records_with_conflict": sum(1 for r in by_record.values() if r["has_conflict"]),
+            "records": list(by_record.values()),
+        }
+
+    def filter_changes_by_impact(self, batch_id: int = None,
+                                impact_filter: str = IMPACT_FILTER_ALL_AFFECTED,
+                                operator: str = None) -> List[Dict]:
+        logs = self.db.get_batch_change_logs(batch_id=batch_id)
+
+        filter_map = {
+            IMPACT_FILTER_CONFIRMED: lambda l: l["impact_type"] in (
+                IMPACT_TYPE_CONFIRMED, IMPACT_TYPE_CRITICAL
+            ),
+            IMPACT_FILTER_PENDING: lambda l: l["impact_type"] == IMPACT_TYPE_PENDING,
+            IMPACT_FILTER_REVOKED: lambda l: l["impact_type"] == IMPACT_TYPE_REVOKED,
+            IMPACT_FILTER_ALL_AFFECTED: lambda l: l["impact_type"] != IMPACT_TYPE_NONE,
+        }
+
+        predicate = filter_map.get(impact_filter, filter_map[IMPACT_FILTER_ALL_AFFECTED])
+        filtered = [l for l in logs if predicate(l)]
+
+        self.db.insert_audit_log(
+            action_type=AUDIT_ACTION_CHANGE_VIEWED,
+            action_category=AUDIT_CATEGORY_CHANGE_VIEW,
+            action_summary=(
+                f"按影响筛选批次 #{batch_id if batch_id else '全部'} "
+                f"变更：筛选={impact_filter}, 命中={len(filtered)}/{len(logs)}"
+            ),
+            batch_id=batch_id,
+            operator=operator,
+            status="success",
+        )
+
+        return filtered
 
 
 def get_current_user() -> str:

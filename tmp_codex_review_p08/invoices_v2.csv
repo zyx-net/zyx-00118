@@ -1,0 +1,5 @@
+invoice_no,invoice_date,customer,amount,status,remark
+RINV001,2024-01-10,Alpha Co,150.00,normal,amount changed after confirmed
+RINV002,2024-01-11,Beta Co,200.00,void,status changed while pending
+RINV003,2024-01-12,Gamma Co,300.00,normal,reimport after revoke
+RINV004,2024-01-13,Delta Co,400.00,normal,new record
